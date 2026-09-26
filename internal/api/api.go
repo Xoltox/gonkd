@@ -60,8 +60,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 // --- OctoPrint subset ---
 // OrcaSlicer's OctoPrint host probes GET /api/version to confirm the target
-// looks like OctoPrint (it checks the response has "api"/"server" fields),
-// then uses POST /api/files/local with multipart fields file/print/select
+// looks like OctoPrint - it requires "text" to start with "OctoPrint", else
+// it fails with "Mismatched type of print host". Its uploader then uses
+// POST /api/files/local with multipart fields file/print/path (not select)
 // to upload+print, and polls /api/job + /api/printer for status. Accepting
 // any (or no) X-Api-Key matches the task's "accept any" requirement, and
 // keeps setup friction near zero on a LAN-only box.
@@ -73,7 +74,7 @@ type versionResp struct {
 }
 
 func (s *Server) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, versionResp{API: "0.1", Server: forgeVersion, Text: "forge " + forgeVersion})
+	writeJSON(w, 200, versionResp{API: "0.1", Server: "1.9.0", Text: "OctoPrint 1.9.0 (forge " + forgeVersion + ")"})
 }
 
 func (s *Server) handleAPIServer(w http.ResponseWriter, r *http.Request) {
