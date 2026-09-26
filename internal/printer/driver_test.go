@@ -568,8 +568,8 @@ func TestAckStallReplays(t *testing.T) {
 	})
 }
 
-// R-03: the replay after a resend is lost too while the duplicate-resend
-// budget is still standing; the stall replay recovers.
+// R-03: the replay after a resend is lost too and nothing asks again;
+// the stall replay recovers.
 func TestAckStallAfterLostReplay(t *testing.T) {
 	old := stallAfter
 	stallAfter = 100 * time.Millisecond

@@ -275,6 +275,7 @@ func (m *Manager) refreshLocked(st SDStatus) *Job {
 		case m.reconcile:
 			m.endJobLocked(StateIdle, "the SD print was no longer running after the printer reconnected")
 		case m.sdSeen:
+			log.Printf("forge: SD print of %s finished", j.Filename)
 			m.endJobLocked(StateIdle, "")
 		case time.Since(j.StartedAt) > sdStartGrace:
 			m.failLocked(fmt.Sprintf("SD print of %s did not start", j.Filename))
@@ -307,6 +308,7 @@ func (m *Manager) handleEvent(d *Driver, ev Event, line string) {
 	switch ev {
 	case EventDonePrinting:
 		if sdPrinting {
+			log.Printf("forge: SD print of %s finished", m.job.Filename)
 			m.endJobLocked(StateIdle, "")
 		}
 		m.sdIgnore = true
@@ -415,6 +417,7 @@ func (m *Manager) failJob(job *Job, msg string) bool {
 func (m *Manager) finishJob(job *Job) {
 	m.mu.Lock()
 	if m.job == job {
+		log.Printf("forge: job %s done (%s)", job.Filename, job.Mode)
 		m.endJobLocked(StateIdle, "")
 	}
 	m.mu.Unlock()

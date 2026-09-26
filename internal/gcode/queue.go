@@ -39,18 +39,13 @@ type Sent struct {
 	Cmd string
 }
 
-// resendIgnoreFor bounds the duplicate-resend budget in time. Marlin's
-// gcode_line_error drains its RX buffer on every error, so the lines behind
-// a bad one do not reliably draw their own "Resend: n"; a budget left
-// standing would swallow a genuine request (a lost or eaten replay).
-const resendIgnoreFor = 2 * time.Second
-
 // Window implements Marlin's line-numbered send-ahead protocol:
 //   - Every non-emergency command gets a monotonically increasing N.
 //   - Up to `capacity` (Marlin's BUFSIZE) lines may be outstanding (sent,
 //     not yet ok'd) at once, keeping Marlin's command buffer full without
 //     overrunning it.
-//   - On Resend:<n>, every outstanding line from n onward is replayed.
+//   - On Resend:<n>, every outstanding line from n onward is replayed,
+//     but only once Marlin has gone quiet (NoteResend / TakeResend).
 //   - An M110 is a barrier: Marlin sets its line counter from M110 both on
 //     receipt and again when the queued command executes, so a numbered
 //     line received in between would be rewound (and a later replay could
@@ -70,13 +65,22 @@ type Window struct {
 	// skipBare swallows the bare "ok" Marlin prints right after
 	// "Resend: <n>" (queue.cpp flush_and_request_resend).
 	skipBare bool
-	// Duplicate resend suppression: lines already in flight behind a
-	// corrupted one may draw their own "Resend: <n>" for the same n.
-	// Replaying on each of them snowballs, so for a short time after one
-	// replay up to resendIgnore further requests for the same n are ignored.
-	resendN      int64
-	resendIgnore int
-	resendAt     time.Time
+	// Deferred resend. Marlin's gcode_line_error (queue.cpp) drains its
+	// RX buffer and answers Error + "Resend: last+1" + "ok" for every bad
+	// line, and whatever was still in transit arrives after the drain as a
+	// headless fragment that draws the next error and the next drain. A
+	// replay written into that burst is chopped up by the drains and
+	// starts the cycle again, so a request is only recorded here (the
+	// latest n wins: it is Marlin's last_N+1) and nothing is written until
+	// no further request arrived for a quiet period. An "ok N<k>" with
+	// k >= pendN arriving meanwhile means Marlin took those lines after
+	// all (they were behind the fragment that drew the request), so the
+	// request moves on to k+1 instead of going stale; pendStale is set
+	// when the request was already stale on arrival (printer reset).
+	pending   bool
+	pendStale bool
+	pendN     int64
+	pendAt    time.Time
 
 	// barrier: outstand[0] is an M110 whose ok must arrive before any
 	// other line is written. heldUntil > 0: the lines after it up to that
@@ -105,20 +109,20 @@ func (w *Window) Reset(startN int64) {
 	w.nextN = startN
 	w.outstand = nil
 	w.skipBare = false
-	w.resendN = 0
-	w.resendIgnore = 0
+	w.pending = false
 	w.barrier = false
 	w.heldUntil = 0
 	w.replay = nil
 }
 
 // CanSend reports whether a new line may be written now: the window has
-// room, no M110 barrier is outstanding and no released lines are waiting
-// to be replayed.
+// room, no M110 barrier is outstanding, no released lines are waiting to
+// be replayed and no resend request is pending (a new line written into
+// an error burst would only be drained and draw another error).
 func (w *Window) CanSend() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return len(w.outstand) < w.capacity && !w.barrier && len(w.replay) == 0
+	return len(w.outstand) < w.capacity && !w.barrier && len(w.replay) == 0 && !w.pending
 }
 
 // NextN returns the line number the next Prepare will use.
@@ -222,8 +226,8 @@ func (w *Window) Ack(r Response) {
 		}
 	}
 	w.drop(i)
-	if w.resendIgnore > 0 && r.OKLine >= w.resendN {
-		w.resendN, w.resendIgnore = 0, 0
+	if w.pending && !w.pendStale && r.OKLine >= w.pendN {
+		w.pendN = r.OKLine + 1
 	}
 }
 
@@ -239,7 +243,44 @@ func (w *Window) TakeReplay() []Sent {
 	return r
 }
 
-// Resend handles "Resend: <n>" and returns what to put back on the wire.
+// NoteResend records "Resend: <n>" without replaying anything yet (see
+// the pending field). Marlin sends one Error + Resend + "ok" per rejected
+// line or fragment, so a burst of requests collapses into one replay of
+// the latest n, returned by TakeResend once the burst is over.
+func (w *Window) NoteResend(n int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.skipBare = true
+	w.pending = true
+	w.pendN = n
+	w.pendAt = time.Now()
+	first := w.nextN
+	if len(w.outstand) > 0 {
+		first = w.outstand[0].N
+	}
+	w.pendStale = n < first || n > w.nextN
+}
+
+// TakeResend returns the replay for the pending resend request once no
+// further request arrived for quiet. wait > 0 means one is pending but not
+// due yet (ask again after wait); lines, resync and k are as for Resend.
+// With nothing pending everything is zero.
+func (w *Window) TakeResend(quiet time.Duration) (lines []Sent, resync bool, k int64, wait time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.pending {
+		return nil, false, 0, 0
+	}
+	if left := quiet - time.Since(w.pendAt); left > 0 {
+		return nil, false, 0, left
+	}
+	w.pending = false
+	lines, resync, k = w.resendLocked(w.pendN)
+	return lines, resync, k, 0
+}
+
+// Resend handles "Resend: <n>" at once (NoteResend + TakeResend without
+// the quiet period) and returns what to put back on the wire.
 //
 // Normally lines holds the outstanding lines from n onward, to be
 // retransmitted verbatim (they stay outstanding until acked). If n is not a
@@ -248,21 +289,21 @@ func (w *Window) TakeReplay() []Sent {
 // expect the oldest outstanding line next; the outstanding lines are held
 // and released by its ack (TakeReplay). Looping on the stale request would
 // never converge. While a barrier is outstanding only the barrier is
-// replayed. A duplicate request for a line that was just handled returns
-// nothing.
+// replayed.
 func (w *Window) Resend(n int64) (lines []Sent, resync bool, k int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.skipBare = true
+	w.pending = false
+	return w.resendLocked(n)
+}
+
+func (w *Window) resendLocked(n int64) (lines []Sent, resync bool, k int64) {
 	if w.barrier {
 		return []Sent{w.outstand[0]}, false, 0
 	}
 	if len(w.replay) > 0 {
 		// The released lines are about to be written anyway.
-		return nil, false, 0
-	}
-	if n == w.resendN && w.resendIgnore > 0 && time.Since(w.resendAt) < resendIgnoreFor {
-		w.resendIgnore--
 		return nil, false, 0
 	}
 	first := w.nextN
@@ -277,7 +318,6 @@ func (w *Window) Resend(n int64) (lines []Sent, resync bool, k int64) {
 		}
 		w.outstand = append([]Sent{b}, w.outstand...)
 		w.barrier = true
-		w.resendN, w.resendIgnore = 0, 0
 		w.progress = time.Now()
 		return []Sent{b}, true, k
 	}
@@ -286,16 +326,10 @@ func (w *Window) Resend(n int64) (lines []Sent, resync bool, k int64) {
 			lines = append(lines, s)
 		}
 	}
-	w.resendN = n
-	w.resendIgnore = len(lines) - 1
-	if w.resendIgnore < 0 {
-		w.resendIgnore = 0
-	}
-	w.resendAt = time.Now()
 	return lines, false, 0
 }
 
-// Replay is the ack-stall recovery: it clears the duplicate-resend budget,
+// Replay is the ack-stall recovery: it drops a pending resend request,
 // restarts the stall clock and returns every outstanding line to write
 // again (only the barrier while one is outstanding). Marlin silently drops
 // a duplicate of its last two accepted lines and answers an older one with
@@ -303,7 +337,7 @@ func (w *Window) Resend(n int64) (lines []Sent, resync bool, k int64) {
 func (w *Window) Replay() []Sent {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.resendN, w.resendIgnore = 0, 0
+	w.pending = false
 	w.progress = time.Now()
 	if w.barrier {
 		return []Sent{w.outstand[0]}

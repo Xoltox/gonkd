@@ -3,6 +3,7 @@ package gcode
 import (
 	"strconv"
 	"testing"
+	"time"
 )
 
 func okN(n int64) Response { return ParseLine("ok N" + strconv.FormatInt(n, 10) + " P30 B15") }
@@ -113,25 +114,60 @@ func TestWindowM110Barrier(t *testing.T) {
 	}
 }
 
-func TestWindowResendBudgetExpires(t *testing.T) {
+// A burst of "Resend:" requests (one per rejected line or fragment, each
+// followed by a bare ok) collapses into one replay of the latest n, given
+// out only after the burst has been quiet; nothing new is sent meanwhile.
+func TestWindowDeferredResend(t *testing.T) {
 	w := NewWindow(16)
+	w.Ack(okN(0)) // ADVANCED_OK seen
 	for i := 0; i < 4; i++ {
-		w.Prepare("G1 X1")
+		w.Prepare("G1 X1") // N1..N4
 	}
-	if l, _, _ := w.Resend(1); len(l) != 4 {
-		t.Fatalf("first resend = %+v", l)
+	if l, _, _, wait := w.TakeResend(time.Hour); l != nil || wait != 0 {
+		t.Fatalf("nothing pending, got %+v wait=%v", l, wait)
 	}
-	w.mu.Lock()
-	w.resendAt = w.resendAt.Add(-2 * resendIgnoreFor)
-	w.mu.Unlock()
-	if l, _, _ := w.Resend(1); len(l) != 4 {
-		t.Fatalf("resend after the budget expired was ignored: %+v", l)
+	w.NoteResend(2)
+	w.Ack(ParseLine("ok"))
+	w.NoteResend(2)
+	w.Ack(ParseLine("ok"))
+	w.Ack(okN(1))
+	if w.CanSend() {
+		t.Fatal("CanSend with a resend pending")
 	}
-	if l := w.Replay(); len(l) != 4 {
+	if l, _, _, wait := w.TakeResend(time.Hour); l != nil || wait <= 0 {
+		t.Fatalf("not quiet yet, got %+v wait=%v", l, wait)
+	}
+	w.NoteResend(3) // N2 arrived intact after the drain after all
+	w.Ack(ParseLine("ok"))
+	l, resync, _, wait := w.TakeResend(0)
+	if resync || wait != 0 || len(l) != 2 || l[0].N != 3 || l[1].N != 4 {
+		t.Fatalf("take = %+v resync=%v wait=%v", l, resync, wait)
+	}
+	if !w.CanSend() || w.Outstanding() != 3 {
+		t.Fatalf("after take CanSend=%v outstanding=%d", w.CanSend(), w.Outstanding())
+	}
+	if l, _, _, _ := w.TakeResend(0); l != nil {
+		t.Fatalf("second take = %+v", l)
+	}
+	// A request for a replay that got eaten is honoured again.
+	w.NoteResend(3)
+	if l, _, _, _ := w.TakeResend(0); len(l) != 2 {
+		t.Fatalf("repeat request = %+v", l)
+	}
+	// Lines that were behind the fragment and got through after all move
+	// the request on instead of making it stale.
+	w.NoteResend(3)
+	w.Ack(okN(3))
+	if l, resync, _, _ := w.TakeResend(0); resync || len(l) != 1 || l[0].N != 4 {
+		t.Fatalf("after ok N3 take = %+v resync=%v", l, resync)
+	}
+	// The stall replay drops a pending request.
+	w.NoteResend(4)
+	if l := w.Replay(); len(l) != 1 {
 		t.Fatalf("replay = %+v", l)
 	}
-	if l, _, _ := w.Resend(1); len(l) != 4 {
-		t.Fatalf("Replay did not clear the budget: %+v", l)
+	if l, _, _, wait := w.TakeResend(0); l != nil || wait != 0 || !w.CanSend() {
+		t.Fatalf("Replay left the request pending: %+v", l)
 	}
 }
 
@@ -169,13 +205,9 @@ func TestWindowResendReplaysFromN(t *testing.T) {
 	if w.Outstanding() != 3 {
 		t.Fatalf("outstanding after resend = %d, want 3", w.Outstanding())
 	}
-	// N3 was in flight behind N2 and draws one duplicate "Resend: 2".
-	if lines, resync, _ := w.Resend(2); resync || len(lines) != 0 {
-		t.Fatalf("duplicate resend should be ignored, got %+v", lines)
-	}
 	// A further request is honoured again (replay itself got corrupted).
 	if lines, _, _ := w.Resend(2); len(lines) != 2 {
-		t.Fatalf("third resend should replay, got %+v", lines)
+		t.Fatalf("second resend should replay, got %+v", lines)
 	}
 }
 

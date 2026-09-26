@@ -63,6 +63,15 @@ const (
 // variable so tests can shorten it.
 var stallAfter = 5 * time.Second
 
+// resendQuiet is how long no further "Resend:" must arrive before a resend
+// request is answered (see gcode.Window.NoteResend). Marlin drains its RX
+// buffer on every line error (queue.cpp gcode_line_error), so bytes still
+// in transit (CH341 hands them over in small USB packets) turn into
+// headless fragments that draw one more error and drain each; a replay
+// written into that burst would be eaten by it. 250000 baud moves a full
+// 16-line window in well under this.
+var resendQuiet = 100 * time.Millisecond
+
 // initCommands are sent by Start and again after a printer reset:
 // capabilities, 2 s temperature and SD-status autoreports, SD listing.
 var initCommands = []string{"M115", "M155 S2", "M27 S2", "M20 L"}
@@ -114,8 +123,10 @@ type Driver struct {
 
 	lastRX atomic.Int64 // unix nanos of the last complete line
 
-	acks       atomic.Uint64 // ok lines received, for the stall backoff
-	stallAfter time.Duration // set before Start; tests shorten it
+	acks        atomic.Uint64 // ok lines received, for the stall backoff
+	stallAfter  time.Duration // set before Start; tests shorten it
+	stallCount  atomic.Uint64 // ack-stall replays done, for tests
+	resendQuiet time.Duration // set before Start
 
 	dead      chan struct{}
 	failOnce  sync.Once
@@ -148,7 +159,8 @@ func New(conn Conn, bufsize int) *Driver {
 		notify: make(chan struct{}, 1),
 		dead:   make(chan struct{}),
 
-		stallAfter: stallAfter,
+		stallAfter:  stallAfter,
+		resendQuiet: resendQuiet,
 	}
 }
 
@@ -456,11 +468,15 @@ func (d *Driver) pumpLoop() {
 
 	var held *queuedCmd // taken off the queue, not yet numbered
 	for {
+		// Answer a pending resend request once Marlin has gone quiet;
+		// until then resendC wakes the loop when it may be due.
+		resendC := d.serviceResend()
 		if held == nil && d.window.CanSend() {
 			select {
 			case <-d.dead:
 				return
 			case <-d.notify:
+			case <-resendC:
 			case <-ticker.C:
 				d.checkStall(&st)
 			case q := <-d.sendCh:
@@ -497,10 +513,39 @@ func (d *Driver) pumpLoop() {
 		case <-d.dead:
 			return
 		case <-d.notify:
+		case <-resendC:
 		case <-ticker.C:
 			d.checkStall(&st)
 		}
 	}
+}
+
+// serviceResend writes the replay for a pending resend request once no
+// further request arrived for resendQuiet (gcode.Window.TakeResend). It
+// returns a channel that fires when a request still pending may be due,
+// or nil. The replay starts with a bare newline: it ends any fragment
+// left in Marlin's line buffer by a lost byte, so that fragment cannot
+// swallow the first replayed line (an empty line is ignored).
+func (d *Driver) serviceResend() <-chan time.Time {
+	d.wmu.Lock()
+	defer d.wmu.Unlock()
+	lines, resync, k, wait := d.window.TakeResend(d.resendQuiet)
+	if wait > 0 {
+		return time.After(wait)
+	}
+	if resync {
+		log.Printf("forge: resend is stale, resyncing with M110 N%d", k)
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteByte('\n')
+	for _, s := range lines {
+		b.WriteString(gcode.FrameLine(s.N, s.Cmd))
+	}
+	_ = d.write(b.String())
+	return nil
 }
 
 // stallState is the pump's ack-stall backoff.
@@ -511,8 +556,8 @@ type stallState struct {
 
 // checkStall is the ack-stall recovery: lines are outstanding and nothing
 // was acked for st.wait although the printer was not reporting "busy:". A
-// lost replay, a resend request swallowed by the duplicate budget or an
-// eaten line leaves Marlin waiting for a line and forge waiting for an ok;
+// lost replay, a lost "Resend:" or an eaten line leaves Marlin waiting
+// for a line and forge waiting for an ok;
 // replaying every outstanding line breaks that (Marlin drops or
 // re-requests what it already has). Repeated replays without any ack in
 // between back off, so a genuinely slow command costs little.
@@ -526,6 +571,7 @@ func (d *Driver) checkStall(st *stallState) {
 	d.wmu.Lock()
 	lines := d.window.Replay()
 	if len(lines) > 0 {
+		d.stallCount.Add(1)
 		log.Printf("forge: no ack for %v, replaying %d outstanding line(s) from N%d", st.wait, len(lines), lines[0].N)
 	}
 	for _, s := range lines {
@@ -601,23 +647,15 @@ func (d *Driver) writeReplay() {
 	}
 }
 
-// handleResend replays what Marlin asked for. A request for a line the
-// window no longer holds (printer reset, stale numbering) is answered with
-// an M110 that moves Marlin's counter to the oldest line still held; those
+// handleResend records what Marlin asked for; the pump replays it once
+// the error burst is over (serviceResend). A request for a line the window
+// no longer holds (printer reset, stale numbering) is answered with an
+// M110 that moves Marlin's counter to the oldest line still held; those
 // lines follow once the M110 is acked (writeReplay), instead of an endless
 // resend loop.
 func (d *Driver) handleResend(n int64) {
-	d.wmu.Lock()
-	defer d.wmu.Unlock()
-	lines, resync, k := d.window.Resend(n)
-	if resync {
-		log.Printf("forge: resend %d is stale, resyncing with M110 N%d", n, k)
-	}
-	for _, s := range lines {
-		if d.write(gcode.FrameLine(s.N, s.Cmd)) != nil {
-			return
-		}
-	}
+	d.window.NoteResend(n)
+	d.poke()
 }
 
 // resync handles a printer reset after Handshake: every queued line is

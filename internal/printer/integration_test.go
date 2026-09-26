@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"sort"
@@ -54,6 +55,16 @@ type fakeMarlin struct {
 	m29Hold    chan struct{} // delays the M29 reply until closed
 	sawM29     bool
 	m29Acked   bool
+
+	// Byte-level RX model (rxModel, set before start): see rxReader.
+	rxModel  bool
+	damage   int        // 1 in damage 32-byte packets gets one byte flipped or lost (0: none)
+	rng      *rand.Rand // for damage
+	slowEach int        // after this many saved lines, stall 1 ms (an SD block write)
+	rxMu     sync.Mutex
+	rxCond   *sync.Cond
+	rx       []byte // Marlin's RX buffer: received, not yet parsed
+	rxEOF    bool
 }
 
 func newFakeMarlin(conn net.Conn) *fakeMarlin {
@@ -120,7 +131,83 @@ func (f *fakeMarlin) reboot() {
 
 func (f *fakeMarlin) okN(n int64) string { return fmt.Sprintf("ok N%d P63 B15\n", n) }
 
+// rxReader is reader for rxModel: it models the wire and Marlin's RX
+// buffer byte by byte. Bytes arrive in 32-byte packets (the CH341's bulk
+// size), 1 in damage packets gets one byte flipped or lost, and a line
+// error drains everything received so far (queue.cpp gcode_line_error),
+// so the rest of a line still in transit arrives as a headless fragment
+// ("No Checksum with line number" while saving), which drains again.
+func (f *fakeMarlin) rxReader() {
+	f.rxCond = sync.NewCond(&f.rxMu)
+	go func() {
+		buf := make([]byte, 32)
+		for {
+			n, err := f.conn.Read(buf)
+			if err != nil {
+				f.rxMu.Lock()
+				f.rxEOF = true
+				f.rxCond.Broadcast()
+				f.rxMu.Unlock()
+				f.stop()
+				return
+			}
+			pkt := append([]byte(nil), buf[:n]...)
+			f.mu.Lock()
+			if f.damage > 0 && f.rng.IntN(f.damage) == 0 {
+				i := f.rng.IntN(len(pkt))
+				if pkt[i] != '\n' {
+					if f.rng.IntN(2) == 0 {
+						pkt[i] ^= 0x04 // never makes or breaks a newline
+					} else {
+						pkt = append(pkt[:i], pkt[i+1:]...)
+					}
+				}
+			}
+			f.mu.Unlock()
+			f.rxMu.Lock()
+			f.rx = append(f.rx, pkt...)
+			f.rxCond.Broadcast()
+			f.rxMu.Unlock()
+		}
+	}()
+	var line []byte
+	for {
+		f.rxMu.Lock()
+		for len(f.rx) == 0 && !f.rxEOF {
+			f.rxCond.Wait()
+		}
+		if len(f.rx) == 0 {
+			f.rxMu.Unlock()
+			return
+		}
+		c := f.rx[0]
+		f.rx = f.rx[1:]
+		f.rxMu.Unlock()
+		if c != '\n' {
+			line = append(line, c)
+			continue
+		}
+		s := strings.TrimRight(string(line), "\r")
+		line = line[:0]
+		if s == "" {
+			continue
+		}
+		f.mu.Lock()
+		f.seen = append(f.seen, s)
+		slow := f.slowEach > 0 && f.saving && f.saved%f.slowEach == 0
+		f.mu.Unlock()
+		f.handle(marlinStore(s))
+		if slow {
+			time.Sleep(time.Millisecond) // RX keeps filling meanwhile
+		}
+	}
+}
+
 func (f *fakeMarlin) reader() {
+	if f.rxModel {
+		f.rxReader()
+		return
+	}
 	r := bufio.NewReader(f.conn)
 	for {
 		line, err := r.ReadString('\n')
@@ -182,6 +269,11 @@ func (f *fakeMarlin) handle(line string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !strings.HasPrefix(line, "N") {
+		if f.saving && strings.TrimSpace(line) != "M29" {
+			// queue.cpp: an unnumbered line while saving
+			f.lineError("No Checksum with line number")
+			return
+		}
 		f.accepted = append(f.accepted, "raw:"+line)
 		return
 	}
@@ -194,6 +286,14 @@ func (f *fakeMarlin) handle(line string) {
 	n, err := strconv.ParseInt(line[1:sp], 10, 64)
 	if err == nil && f.swallow[n] > 0 {
 		f.swallow[n]--
+		return
+	}
+	// queue.cpp checks the sequence before the checksum.
+	if err == nil && n != f.lastN+1 && !strings.Contains(line, "M110") {
+		if n >= f.lastN-1 && n <= f.lastN {
+			return // a duplicate of the last two lines is dropped silently
+		}
+		f.lineError("Line Number is not Last Line Number+1")
 		return
 	}
 	cs, err2 := strconv.Atoi(line[star+1:])
@@ -304,9 +404,15 @@ func (f *fakeMarlin) handle(line string) {
 }
 
 // lineError answers like queue.cpp gcode_line_error: error text, then
-// "Resend: last+1" and a bare "ok". Caller holds f.mu.
+// "Resend: last+1" and a bare "ok", after draining the RX buffer (only
+// modelled with rxModel). Caller holds f.mu.
 func (f *fakeMarlin) lineError(msg string) {
 	f.resends++
+	if f.rxModel {
+		f.rxMu.Lock()
+		f.rx = f.rx[:0]
+		f.rxMu.Unlock()
+	}
 	f.send(fmt.Sprintf("Error:%s, Last Line: %d\nResend: %d\nok\n", msg, f.lastN, f.lastN+1))
 }
 
@@ -466,4 +572,57 @@ func TestDriverASCIIUploadCapturesBytes(t *testing.T) {
 	if d.Uploading() {
 		t.Fatal("still uploading after return")
 	}
+}
+
+// A long upload over a lossy link: random flipped or lost bytes, RX drains
+// on every error and the headless fragments they leave behind. Every error
+// burst must be recovered by one deferred resend, not by the 5 s ack-stall
+// replay, and the file on the card must be exactly what was sent.
+func TestUploadSurvivesCorruptionAndRXFlush(t *testing.T) {
+	d, fm := startDriver(t, func(fm *fakeMarlin) {
+		fm.rxModel = true
+		fm.rng = rand.New(rand.NewPCG(1, 2))
+		fm.slowEach = 64
+	})
+	fm.mu.Lock()
+	fm.damage = 40
+	fm.resends = 0
+	fm.mu.Unlock()
+
+	const lines = 3000
+	var want strings.Builder
+	for i := 0; i < lines; i++ {
+		fmt.Fprintf(&want, "G1 X%d Y%d\n", i, i)
+	}
+	names := NewNameMap(t.TempDir() + "/names.json")
+	done := make(chan error, 1)
+	var short string
+	go func() {
+		var err error
+		short, err = d.UploadToSD(context.Background(), writeGcode(t, lines), "lossy.gcode", names, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("UploadToSD: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("upload did not finish")
+	}
+
+	fm.mu.Lock()
+	fm.damage = 0
+	got, resends := fm.card[short], fm.resends
+	fm.mu.Unlock()
+	if resends == 0 {
+		t.Fatal("no line errors: the corruption was not exercised")
+	}
+	if got != want.String() {
+		t.Fatalf("card content differs: got %d bytes, want %d", len(got), want.Len())
+	}
+	if n := d.stallCount.Load(); n != 0 {
+		t.Fatalf("%d ack-stall replay(s) over %d line errors", n, resends)
+	}
+	t.Logf("%d line errors recovered without a stall", resends)
 }
