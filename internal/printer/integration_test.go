@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"forge/internal/gcode"
+	"github.com/Xoltox/gonkd/internal/gcode"
 )
 
 // fakeMarlin emulates just enough of Marlin 2.1's serial host protocol to
@@ -524,7 +524,7 @@ func TestDriverASCIIUploadCapturesBytes(t *testing.T) {
 	dir := t.TempDir()
 	names := NewNameMap(dir + "/names.json")
 	d, fm := startDriver(t, func(fm *fakeMarlin) {
-		fm.card["TEST.GCO"] = "G28\n" // not forge's: must not be overwritten
+		fm.card["TEST.GCO"] = "G28\n" // not gonkd's: must not be overwritten
 	})
 
 	path := dir + "/test.gcode"

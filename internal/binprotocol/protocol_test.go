@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"forge/internal/heatshrink"
+	"github.com/Xoltox/gonkd/internal/heatshrink"
 )
 
 // fakeMarlin runs a minimal in-process server implementing this package's

@@ -1,4 +1,4 @@
-// Command forge is a lean print server bridging a USB-attached Marlin 2.1
+// Command gonkd is a lean print server bridging a USB-attached Marlin 2.1
 // printer to the network: an OctoPrint-compatible subset for slicers plus a
 // small embedded web UI, sized to run comfortably on a Creality Wi-Fi Box
 // (OpenWrt, MT7628, 128MB RAM, no FPU).
@@ -16,17 +16,17 @@ import (
 	"syscall"
 	"time"
 
-	"forge/internal/api"
-	"forge/internal/printer"
-	"forge/internal/web"
+	"github.com/Xoltox/gonkd/internal/api"
+	"github.com/Xoltox/gonkd/internal/printer"
+	"github.com/Xoltox/gonkd/internal/web"
 )
 
 func main() {
 	listen := flag.String("listen", ":80", "HTTP listen address")
 	port := flag.String("port", "/dev/ttyUSB0", "serial port to the printer")
 	baud := flag.Int("baud", 250000, "serial baud rate")
-	dataDir := flag.String("data-dir", "/tmp/forge", "scratch dir for staged uploads")
-	namesFile := flag.String("names-file", "/etc/forge/names.json", "long/short filename map")
+	dataDir := flag.String("data-dir", "/tmp/gonkd", "scratch dir for staged uploads")
+	namesFile := flag.String("names-file", "/etc/gonkd/names.json", "long/short filename map")
 	maxUploadMB := flag.Int("max-upload-mb", 40, "reject uploads larger than this many MiB")
 	defaultMode := flag.String("default-mode", "sd", "default upload mode: sd or stream")
 	bufsize := flag.Int("bufsize", 16, "outstanding-line budget; match Marlin's BUFSIZE")
@@ -40,7 +40,7 @@ func main() {
 
 	log.SetFlags(0)
 	log.SetOutput(os.Stdout)
-	log.Printf("forge starting: port=%s baud=%d listen=%s mode=%s", *port, *baud, *listen, *defaultMode)
+	log.Printf("gonkd starting: port=%s baud=%d listen=%s mode=%s", *port, *baud, *listen, *defaultMode)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -59,7 +59,7 @@ func main() {
 
 	mode := printer.UploadMode(*defaultMode)
 	if mode != printer.ModeSDUpload && mode != printer.ModeStream {
-		log.Printf("forge: unknown -default-mode %q, using sd", *defaultMode)
+		log.Printf("gonkd: unknown -default-mode %q, using sd", *defaultMode)
 		mode = printer.ModeSDUpload
 	}
 
@@ -98,14 +98,14 @@ func main() {
 		_ = httpSrv.Shutdown(sctx)
 	}()
 
-	log.Printf("forge listening on %s", *listen)
+	log.Printf("gonkd listening on %s", *listen)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("forge: http server: %v", err)
+		log.Fatalf("gonkd: http server: %v", err)
 	}
 	// Let the link close the port cleanly (procd's term_timeout is 5s).
 	select {
 	case <-linkDone:
 	case <-time.After(2 * time.Second):
 	}
-	log.Printf("forge stopped")
+	log.Printf("gonkd stopped")
 }

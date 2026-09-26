@@ -1,12 +1,12 @@
 #!/bin/sh /etc/rc.common
-# procd init script for forge, a lean print server bridging this box's
+# procd init script for gonkd, a lean print server bridging this box's
 # USB-attached Marlin printer to the network.
 
 START=95
 STOP=10
 USE_PROCD=1
 
-PROG=/usr/bin/forge
+PROG=/usr/bin/gonkd
 
 start_service() {
 	procd_open_instance
@@ -14,12 +14,12 @@ start_service() {
 		-listen ":80" \
 		-port "/dev/ttyUSB0" \
 		-baud 250000 \
-		-data-dir "/tmp/forge" \
-		-names-file "/etc/forge/names.json"
+		-data-dir "/tmp/gonkd" \
+		-names-file "/etc/gonkd/names.json"
 	# To reach the UI by hostname instead of IP, add the name(s) to the
 	# command above, e.g. -allow-host "printbox,printbox.lan"; without
 	# it a hostname URL gets 421 on every button.
-	# Retry forever, 5s apart: forge no longer exits when the printer is
+	# Retry forever, 5s apart: gonkd no longer exits when the printer is
 	# absent, so a respawn loop means a real crash that should not end the
 	# service.
 	procd_set_param respawn 3600 5 0

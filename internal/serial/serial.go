@@ -63,7 +63,7 @@ func Open(path string, baud int) (*Port, error) {
 
 	// Keep DTR asserted when the port is closed. With HUPCL set (the
 	// default) every close drops DTR, and the next open raises it again;
-	// the CH340 board wires DTR to the MCU reset, so a forge restart or
+	// the CH340 board wires DTR to the MCU reset, so a gonkd restart or
 	// reconnect would reset Marlin and kill a running SD print. The tty
 	// keeps this setting after close, so only the very first open after
 	// the USB device appears produces a DTR edge.

@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"forge/internal/gcode"
+	"github.com/Xoltox/gonkd/internal/gcode"
 )
 
 var (
@@ -179,7 +179,7 @@ func (d *Driver) Start() {
 	go d.pumpLoop()
 	for _, c := range initCommands {
 		if err := d.Send(c); err != nil {
-			log.Printf("forge: init %s: %v", c, err)
+			log.Printf("gonkd: init %s: %v", c, err)
 			return
 		}
 	}
@@ -534,7 +534,7 @@ func (d *Driver) serviceResend() <-chan time.Time {
 		return time.After(wait)
 	}
 	if resync {
-		log.Printf("forge: resend is stale, resyncing with M110 N%d", k)
+		log.Printf("gonkd: resend is stale, resyncing with M110 N%d", k)
 	}
 	if len(lines) == 0 {
 		return nil
@@ -557,7 +557,7 @@ type stallState struct {
 // checkStall is the ack-stall recovery: lines are outstanding and nothing
 // was acked for st.wait although the printer was not reporting "busy:". A
 // lost replay, a lost "Resend:" or an eaten line leaves Marlin waiting
-// for a line and forge waiting for an ok;
+// for a line and gonkd waiting for an ok;
 // replaying every outstanding line breaks that (Marlin drops or
 // re-requests what it already has). Repeated replays without any ack in
 // between back off, so a genuinely slow command costs little.
@@ -572,7 +572,7 @@ func (d *Driver) checkStall(st *stallState) {
 	lines := d.window.Replay()
 	if len(lines) > 0 {
 		d.stallCount.Add(1)
-		log.Printf("forge: no ack for %v, replaying %d outstanding line(s) from N%d", st.wait, len(lines), lines[0].N)
+		log.Printf("gonkd: no ack for %v, replaying %d outstanding line(s) from N%d", st.wait, len(lines), lines[0].N)
 	}
 	for _, s := range lines {
 		if d.write(gcode.FrameLine(s.N, s.Cmd)) != nil {
@@ -619,12 +619,12 @@ func (d *Driver) handleLine(raw string) {
 	case gcode.KindResend:
 		d.handleResend(resp.Resend)
 	case gcode.KindStart:
-		log.Printf("forge: printer reset detected, resyncing")
+		log.Printf("gonkd: printer reset detected, resyncing")
 		d.resync()
 		d.emit(EventPrinterReset, resp.Line)
 		return
 	case gcode.KindError:
-		log.Printf("forge: printer error: %s", resp.Message)
+		log.Printf("gonkd: printer error: %s", resp.Message)
 	case gcode.KindOther:
 		if strings.Contains(raw, "busy:") {
 			// HOST_KEEPALIVE: a long command is executing, not a stall.

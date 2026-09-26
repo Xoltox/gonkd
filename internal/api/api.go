@@ -1,6 +1,6 @@
-// Package api implements forge's HTTP surface: a small OctoPrint-compatible
+// Package api implements gonkd's HTTP surface: a small OctoPrint-compatible
 // subset (enough for OrcaSlicer's "Octo/Klipper" host type to test the
-// connection and do one-click upload+print) plus forge's own JSON API used
+// connection and do one-click upload+print) plus gonkd's own JSON API used
 // by the embedded UI.
 package api
 
@@ -19,10 +19,10 @@ import (
 	"strings"
 	"time"
 
-	"forge/internal/printer"
+	"github.com/Xoltox/gonkd/internal/printer"
 )
 
-const forgeVersion = "0.1.0"
+const gonkdVersion = "0.1.0"
 
 // Server wires the Manager to HTTP handlers.
 type Server struct {
@@ -38,7 +38,7 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("forge: write response: %v", err)
+		log.Printf("gonkd: write response: %v", err)
 	}
 }
 
@@ -84,19 +84,19 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/job", s.handleJob)
 	mux.HandleFunc("/api/files/local", s.handleFilesLocal)
 
-	// --- forge's own API ---
-	mux.HandleFunc("/forge/status", s.handleStatus)
-	mux.HandleFunc("/forge/send", s.handleSend)
-	mux.HandleFunc("/forge/console", s.handleConsole)
-	mux.HandleFunc("/forge/files", s.handleSDFiles)
-	mux.HandleFunc("/forge/files/delete", s.handleSDDelete)
-	mux.HandleFunc("/forge/job/pause", s.handleJobPause)
-	mux.HandleFunc("/forge/job/resume", s.handleJobResume)
-	mux.HandleFunc("/forge/job/cancel", s.handleJobCancel)
-	mux.HandleFunc("/forge/job/print", s.handleJobPrint)
-	mux.HandleFunc("/forge/emergency", s.handleEmergency)
-	mux.HandleFunc("/forge/babystep", s.handleBabystep)
-	mux.HandleFunc("/forge/jog", s.handleJog)
+	// --- gonkd's own API ---
+	mux.HandleFunc("/gonkd/status", s.handleStatus)
+	mux.HandleFunc("/gonkd/send", s.handleSend)
+	mux.HandleFunc("/gonkd/console", s.handleConsole)
+	mux.HandleFunc("/gonkd/files", s.handleSDFiles)
+	mux.HandleFunc("/gonkd/files/delete", s.handleSDDelete)
+	mux.HandleFunc("/gonkd/job/pause", s.handleJobPause)
+	mux.HandleFunc("/gonkd/job/resume", s.handleJobResume)
+	mux.HandleFunc("/gonkd/job/cancel", s.handleJobCancel)
+	mux.HandleFunc("/gonkd/job/print", s.handleJobPrint)
+	mux.HandleFunc("/gonkd/emergency", s.handleEmergency)
+	mux.HandleFunc("/gonkd/babystep", s.handleBabystep)
+	mux.HandleFunc("/gonkd/jog", s.handleJog)
 }
 
 // --- CSRF / Host hardening (SEC-5, SEC-25) ---
@@ -105,8 +105,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 // Origin header (or Sec-Fetch-Site: cross-site) is present it must name the
 // same host this request arrived on. The Host header itself must be an IP
 // literal, "localhost", or one of Server.AllowHosts -- this is what lets
-// OrcaSlicer (which addresses forge by IP and sends no Origin at all) through
-// while blocking a browser tab on some unrelated DNS name from driving forge
+// OrcaSlicer (which addresses gonkd by IP and sends no Origin at all) through
+// while blocking a browser tab on some unrelated DNS name from driving gonkd
 // via a cross-site fetch/form.
 func (s *Server) checkMutation(w http.ResponseWriter, r *http.Request, requireJSON bool) bool {
 	if r.Method != http.MethodPost {
@@ -186,12 +186,12 @@ type versionResp struct {
 }
 
 func (s *Server) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, versionResp{API: "0.1", Server: "1.9.0", Text: "OctoPrint 1.9.0 (forge " + forgeVersion + ")"})
+	writeJSON(w, 200, versionResp{API: "0.1", Server: "1.9.0", Text: "OctoPrint 1.9.0 (gonkd " + gonkdVersion + ")"})
 }
 
 func (s *Server) handleAPIServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
-		"version":  forgeVersion,
+		"version":  gonkdVersion,
 		"safemode": nil,
 	})
 }
@@ -225,7 +225,7 @@ func (s *Server) handleConnection(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// OrcaSlicer may POST to (re)connect; forge manages its own serial link,
+	// OrcaSlicer may POST to (re)connect; gonkd manages its own serial link,
 	// so just acknowledge.
 	if !s.checkMutation(w, r, false) {
 		return
@@ -359,7 +359,7 @@ func (s *Server) handleFilesLocal(w http.ResponseWriter, r *http.Request) {
 	s.handleUploadCommon(w, r, r.URL.Query().Get("mode"))
 }
 
-// --- forge's own API ---
+// --- gonkd's own API ---
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.Mgr.Snapshot())
@@ -504,7 +504,7 @@ func (s *Server) handleBabystep(w http.ResponseWriter, r *http.Request) {
 	noContent(w)
 }
 
-// handleJog implements POST /forge/jog: a single validated, ordered
+// handleJog implements POST /gonkd/jog: a single validated, ordered
 // G91/G1/G90 sequence, replacing the UI's old three independent requests
 // (SEC-8) whose ordering across separate HTTP connections was never
 // guaranteed.
@@ -571,7 +571,7 @@ func clamp(v, lo, hi float64) float64 {
 // then hands the staged path to Manager.Upload. Upload is async: it returns
 // once the request is validated (connected, no active job) and the transfer
 // itself runs in the background, so the HTTP request completes quickly and
-// failures during the actual transfer surface via /forge/status.lastError
+// failures during the actual transfer surface via /gonkd/status.lastError
 // (G5).
 func (s *Server) handleUploadCommon(w http.ResponseWriter, r *http.Request, modeParam string) {
 	mode := printer.UploadMode(modeParam)
@@ -707,7 +707,7 @@ func (s *Server) handleUploadCommon(w http.ResponseWriter, r *http.Request, mode
 		return
 	}
 
-	log.Printf("forge: upload staged %q (%d bytes) mode=%s print=%v", longName, written, mode, print)
+	log.Printf("gonkd: upload staged %q (%d bytes) mode=%s print=%v", longName, written, mode, print)
 	writeJSON(w, 201, map[string]interface{}{
 		"done": true,
 		"files": map[string]interface{}{

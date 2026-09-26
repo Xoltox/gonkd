@@ -25,7 +25,7 @@ var (
 )
 
 // sdStartGrace is how long an SD job may report "Not SD printing" after
-// M23/M24 before forge gives up on it (M27 S2 reports every 2s).
+// M23/M24 before gonkd gives up on it (M27 S2 reports every 2s).
 const sdStartGrace = 30 * time.Second
 
 // cancelFlushTimeout bounds how long Cancel waits for Marlin to confirm an
@@ -49,7 +49,7 @@ type driverEvent struct {
 	line string
 }
 
-// lcdJobName labels an SD print forge did not start (LCD or console).
+// lcdJobName labels an SD print gonkd did not start (LCD or console).
 const lcdJobName = "(started on printer)"
 
 // Manager tracks the current job (upload/print/stream) on top of whichever
@@ -91,7 +91,7 @@ func (m *Manager) Attach(d *Driver) {
 		select {
 		case evs <- driverEvent{ev, line}:
 		default:
-			log.Printf("forge: printer event queue full, dropped event %d: %s", ev, line)
+			log.Printf("gonkd: printer event queue full, dropped event %d: %s", ev, line)
 		}
 	})
 	go func() {
@@ -239,7 +239,7 @@ func (m *Manager) sync() {
 }
 
 // refreshLocked applies one M27 status. It returns the job it created when
-// it found an SD print forge did not start.
+// it found an SD print gonkd did not start.
 func (m *Manager) refreshLocked(st SDStatus) *Job {
 	if m.job == nil {
 		if st.NotSD {
@@ -275,7 +275,7 @@ func (m *Manager) refreshLocked(st SDStatus) *Job {
 		case m.reconcile:
 			m.endJobLocked(StateIdle, "the SD print was no longer running after the printer reconnected")
 		case m.sdSeen:
-			log.Printf("forge: SD print of %s finished", j.Filename)
+			log.Printf("gonkd: SD print of %s finished", j.Filename)
 			m.endJobLocked(StateIdle, "")
 		case time.Since(j.StartedAt) > sdStartGrace:
 			m.failLocked(fmt.Sprintf("SD print of %s did not start", j.Filename))
@@ -308,7 +308,7 @@ func (m *Manager) handleEvent(d *Driver, ev Event, line string) {
 	switch ev {
 	case EventDonePrinting:
 		if sdPrinting {
-			log.Printf("forge: SD print of %s finished", m.job.Filename)
+			log.Printf("gonkd: SD print of %s finished", m.job.Filename)
 			m.endJobLocked(StateIdle, "")
 		}
 		m.sdIgnore = true
@@ -357,7 +357,7 @@ func (m *Manager) streamResetLocked(d *Driver) {
 			return
 		}
 		if err := cooldown(d); err != nil {
-			log.Printf("forge: cooldown after printer reset: %v", err)
+			log.Printf("gonkd: cooldown after printer reset: %v", err)
 		}
 	}()
 }
@@ -397,7 +397,7 @@ func (m *Manager) endJobLocked(s State, errMsg string) {
 }
 
 func (m *Manager) failLocked(msg string) {
-	log.Printf("forge: job error: %s", msg)
+	log.Printf("gonkd: job error: %s", msg)
 	m.endJobLocked(StateError, msg)
 }
 
@@ -417,7 +417,7 @@ func (m *Manager) failJob(job *Job, msg string) bool {
 func (m *Manager) finishJob(job *Job) {
 	m.mu.Lock()
 	if m.job == job {
-		log.Printf("forge: job %s done (%s)", job.Filename, job.Mode)
+		log.Printf("gonkd: job %s done (%s)", job.Filename, job.Mode)
 		m.endJobLocked(StateIdle, "")
 	}
 	m.mu.Unlock()
@@ -502,7 +502,7 @@ func (m *Manager) runSD(ctx context.Context, drv *Driver, job *Job, localPath, l
 	}
 	if err := m.Names.Save(); err != nil {
 		// Non-fatal: the file is on the card, only the long name is lost.
-		log.Printf("forge: saving name map: %v", err)
+		log.Printf("gonkd: saving name map: %v", err)
 	}
 	if !startPrint {
 		m.finishJob(job)
@@ -779,7 +779,7 @@ func (m *Manager) Cancel() error {
 // between G91 and G1 would run "G1 Z10" absolute (R-04). The confirmation
 // is M27 reporting "Not SD printing", which Marlin only prints once
 // abortFilePrintNow and queue.clear have both run. Marlin's abort already
-// switches heaters and fans off; forge repeats that and then parks. If the
+// switches heaters and fans off; gonkd repeats that and then parks. If the
 // abort is not confirmed in time the park is skipped. Called with seq held.
 func (m *Manager) cancelSD(drv *Driver) error {
 	wasPrinting := drv.SDStatus().Printing
@@ -788,7 +788,7 @@ func (m *Manager) cancelSD(drv *Driver) error {
 	}
 	if !waitSDAborted(drv, time.Now(), wasPrinting) {
 		msg := "cancel: the printer did not confirm the SD abort; Z was not lifted"
-		log.Printf("forge: %s", msg)
+		log.Printf("gonkd: %s", msg)
 		m.mu.Lock()
 		if m.job == nil {
 			m.lastErr = msg
@@ -1038,7 +1038,7 @@ func (m *Manager) DeleteFile(short string) error {
 	}
 	m.Names.Forget(short)
 	if err := m.Names.Save(); err != nil {
-		log.Printf("forge: saving name map: %v", err)
+		log.Printf("gonkd: saving name map: %v", err)
 	}
 	_ = drv.RefreshFiles()
 	return nil

@@ -3,6 +3,7 @@ package printer
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,7 @@ import (
 // NameEntry maps one long (uploaded) filename to the 8.3 short name Marlin
 // actually stores it under. Marlin's SDSUPPORT + LONG_FILENAME_HOST_SUPPORT
 // lets it report long names for files, but *creates* only 8.3 short names,
-// so forge picks the short name on upload and remembers the mapping.
+// so gonkd picks the short name on upload and remembers the mapping.
 type NameEntry struct {
 	Long  string `json:"long"`
 	Short string `json:"short"` // 8.3, upper-case, as sent in M23/M30
@@ -28,9 +29,36 @@ type NameMap struct {
 }
 
 func NewNameMap(path string) *NameMap {
+	migrateLegacyNames(path)
 	m := &NameMap{path: path, entries: map[string]NameEntry{}}
 	m.load()
 	return m
+}
+
+// legacyNamesPath is the names.json location from before the forge -> gonkd
+// rename.
+const legacyNamesPath = "/etc/forge/names.json"
+
+// migrateLegacyNames copies the old names.json to the new path once, if the
+// new path does not exist yet but the old one does.
+func migrateLegacyNames(newPath string) {
+	if newPath == legacyNamesPath {
+		return
+	}
+	if _, err := os.Stat(newPath); err == nil {
+		return // already have a names.json at the new path
+	}
+	data, err := os.ReadFile(legacyNamesPath)
+	if err != nil {
+		return // nothing to migrate
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
+		return
+	}
+	if err := writeSynced(newPath, data); err != nil {
+		return
+	}
+	log.Printf("gonkd: migrated name map from %s to %s", legacyNamesPath, newPath)
 }
 
 func (m *NameMap) load() {
@@ -113,7 +141,7 @@ func (m *NameMap) Assign(long string) string {
 }
 
 // AssignAvoiding is Assign that also skips any candidate for which taken
-// returns true, e.g. files already on the SD card that forge did not upload
+// returns true, e.g. files already on the SD card that gonkd did not upload
 // (SEC-16). taken may be nil. It runs with the map's lock held, so it must
 // not call back into the NameMap.
 func (m *NameMap) AssignAvoiding(long string, taken func(string) bool) string {

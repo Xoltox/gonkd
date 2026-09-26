@@ -1,4 +1,4 @@
-// Package web embeds forge's single-page UI.
+// Package web embeds gonkd's single-page UI.
 package web
 
 import (

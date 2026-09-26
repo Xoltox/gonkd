@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"forge/internal/printer"
+	"github.com/Xoltox/gonkd/internal/printer"
 )
 
 // newTestServer builds a Server around a disconnected Manager (no Driver
@@ -40,7 +40,7 @@ func newRouter(t *testing.T) *http.ServeMux {
 
 func TestVersionText(t *testing.T) {
 	mux := newRouter(t)
-	req := httptest.NewRequest(http.MethodGet, "http://<box-ip>/api/version", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/api/version", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -78,7 +78,7 @@ func multipartUpload(t *testing.T, url, fileName string, content []byte, print b
 	}
 	req := httptest.NewRequest(http.MethodPost, url, &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Host = "<box-ip>"
+	req.Host = "192.0.2.10"
 	return req
 }
 
@@ -90,7 +90,7 @@ func TestUploadDisconnected(t *testing.T) {
 	mux := http.NewServeMux()
 	s.Routes(mux)
 
-	req := multipartUpload(t, "http://<box-ip>/api/files/local", "benchy.gcode", []byte("G28\nG1 X10\n"), true)
+	req := multipartUpload(t, "http://192.0.2.10/api/files/local", "benchy.gcode", []byte("G28\nG1 X10\n"), true)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -109,7 +109,7 @@ func TestUploadOversize(t *testing.T) {
 	mux := http.NewServeMux()
 	s.Routes(mux)
 
-	req := multipartUpload(t, "http://<box-ip>/api/files/local", "big.gcode", bytes.Repeat([]byte("A"), 4096), false)
+	req := multipartUpload(t, "http://192.0.2.10/api/files/local", "big.gcode", bytes.Repeat([]byte("A"), 4096), false)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -124,7 +124,7 @@ func TestUploadOversize(t *testing.T) {
 
 func TestMutatingRouteRejectsGET(t *testing.T) {
 	mux := newRouter(t)
-	req := httptest.NewRequest(http.MethodGet, "http://<box-ip>/forge/send", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/gonkd/send", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -134,8 +134,8 @@ func TestMutatingRouteRejectsGET(t *testing.T) {
 
 func TestCrossOriginRejected(t *testing.T) {
 	mux := newRouter(t)
-	req := httptest.NewRequest(http.MethodPost, "http://<box-ip>/forge/emergency", nil)
-	req.Host = "<box-ip>"
+	req := httptest.NewRequest(http.MethodPost, "http://192.0.2.10/gonkd/emergency", nil)
+	req.Host = "192.0.2.10"
 	req.Header.Set("Origin", "http://evil.example.com")
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -146,8 +146,8 @@ func TestCrossOriginRejected(t *testing.T) {
 
 func TestJSONRouteRejectsPlainText(t *testing.T) {
 	mux := newRouter(t)
-	req := httptest.NewRequest(http.MethodPost, "http://<box-ip>/forge/send", strings.NewReader(`{"cmd":"M105"}`))
-	req.Host = "<box-ip>"
+	req := httptest.NewRequest(http.MethodPost, "http://192.0.2.10/gonkd/send", strings.NewReader(`{"cmd":"M105"}`))
+	req.Host = "192.0.2.10"
 	req.Header.Set("Content-Type", "text/plain")
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -160,7 +160,7 @@ func TestHostAllowlist(t *testing.T) {
 	mux := newRouter(t)
 
 	// Bad Host: not an IP literal, not localhost, not in AllowHosts.
-	req := httptest.NewRequest(http.MethodPost, "http://printer.example.com/forge/emergency", nil)
+	req := httptest.NewRequest(http.MethodPost, "http://printer.example.com/gonkd/emergency", nil)
 	req.Host = "printer.example.com"
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -168,9 +168,9 @@ func TestHostAllowlist(t *testing.T) {
 		t.Fatalf("bad host status = %d, want 421", rec.Code)
 	}
 
-	// IP literal Host is accepted (this is how OrcaSlicer addresses forge).
-	req2 := httptest.NewRequest(http.MethodPost, "http://<box-ip>/forge/emergency", nil)
-	req2.Host = "<box-ip>"
+	// IP literal Host is accepted (this is how OrcaSlicer addresses gonkd).
+	req2 := httptest.NewRequest(http.MethodPost, "http://192.0.2.10/gonkd/emergency", nil)
+	req2.Host = "192.0.2.10"
 	rec2 := httptest.NewRecorder()
 	mux.ServeHTTP(rec2, req2)
 	// Disconnected Manager -> Emergency() may still error (ErrDisconnected ->
@@ -183,8 +183,8 @@ func TestHostAllowlist(t *testing.T) {
 func TestJogValidation(t *testing.T) {
 	mux := newRouter(t)
 	body := `{"axis":"Q","dist":10,"feed":1000}`
-	req := httptest.NewRequest(http.MethodPost, "http://<box-ip>/forge/jog", strings.NewReader(body))
-	req.Host = "<box-ip>"
+	req := httptest.NewRequest(http.MethodPost, "http://192.0.2.10/gonkd/jog", strings.NewReader(body))
+	req.Host = "192.0.2.10"
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)

@@ -1,6 +1,4 @@
 # Build outputs
-/forge
-/forge.mipsle
 *.bin
 *.exe
 *.test

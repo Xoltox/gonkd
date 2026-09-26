@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"forge/internal/binprotocol"
-	"forge/internal/gcode"
-	"forge/internal/heatshrink"
+	"github.com/Xoltox/gonkd/internal/binprotocol"
+	"github.com/Xoltox/gonkd/internal/gcode"
+	"github.com/Xoltox/gonkd/internal/heatshrink"
 )
 
 // BinaryTransferEnabled gates the binary upload path. Off until it is
@@ -63,12 +63,12 @@ func (d *Driver) UploadToSD(ctx context.Context, localPath, longName string, nam
 	defer d.endUpload()
 
 	// Pick the short name against a fresh listing so a file already on the
-	// card (not created by forge) is never overwritten by M28.
+	// card (not created by gonkd) is never overwritten by M28.
 	if err := d.refreshListing(ctx, gen); err != nil {
 		if ctx.Err() != nil || errors.Is(err, errPrinterReset) || errors.Is(err, ErrClosed) {
 			return "", err
 		}
-		log.Printf("forge: upload: SD listing not refreshed (%v), using the last one", err)
+		log.Printf("gonkd: upload: SD listing not refreshed (%v), using the last one", err)
 	}
 	short := d.assignShort(names, longName)
 
@@ -274,7 +274,7 @@ func (d *Driver) waitDrained(ctx context.Context, gen uint64) error {
 		if err != ErrTimeout {
 			return err
 		}
-		log.Printf("forge: upload: no ack for the final lines, probing with M105")
+		log.Printf("gonkd: upload: no ack for the final lines, probing with M105")
 		if err := d.sendOwned(ctx, gen, "M105"); err != nil {
 			return err
 		}
@@ -381,7 +381,7 @@ func (d *Driver) uploadBinary(ctx context.Context, localPath, short string, size
 }
 
 // stripComment prepares one source line for the wire so that Marlin stores
-// exactly the bytes forge checksums: a ';' comment is cut off for every
+// exactly the bytes gonkd checksums: a ';' comment is cut off for every
 // command, M117/M118 included (Marlin's process_stream_char drops it at
 // receive time, and the checksum with it: this build has no
 // GCODE_QUOTED_STRINGS), then backslashes (Marlin's escape character,

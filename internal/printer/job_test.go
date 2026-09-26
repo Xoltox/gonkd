@@ -731,7 +731,7 @@ func TestMotionRefusedDuringJob(t *testing.T) {
 	}
 }
 
-// R-09: an SD print reported while forge shows an error is adopted, so the
+// R-09: an SD print reported while gonkd shows an error is adopted, so the
 // next upload is refused instead of aborting it with M28.
 func TestPrintAdoptedInErrorState(t *testing.T) {
 	mgr, f := jtRig(t, nil)

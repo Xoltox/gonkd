@@ -1,4 +1,4 @@
-module forge
+module github.com/Xoltox/gonkd
 
 go 1.26.0
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>forge</title>
+<title>Gonk'd</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -58,7 +58,7 @@
 </style>
 </head>
 <body>
-<h1><span id="statusDot" class="dot"></span> forge <span class="small" id="stateText"></span></h1>
+<h1><span id="statusDot" class="dot"></span> Gonk'd <span class="small" id="stateText"></span></h1>
 <div id="connMsg"></div>
 <div id="errMsg"></div>
 
@@ -164,32 +164,32 @@ function api(path, opts) {
 function postJSON(path, body) {
   return api(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
 }
-function cmd(g) { return postJSON('/forge/send', {cmd: g}); }
+function cmd(g) { return postJSON('/gonkd/send', {cmd: g}); }
 
 function jog(axis, dir) {
   const step = document.getElementById('jogStep').value;
   const dist = parseFloat(step) * dir;
-  return postJSON('/forge/jog', {axis: axis, dist: dist, feed: 3000}).catch(showErr);
+  return postJSON('/gonkd/jog', {axis: axis, dist: dist, feed: 3000}).catch(showErr);
 }
 // Extrude/retract always move a fixed amount of filament, independent of
 // the XYZ jog step selector (R-12: they used to be multiplied by it).
 function extrudeFixed(mm) {
-  return postJSON('/forge/jog', {axis: 'E', dist: mm, feed: 300}).catch(showErr);
+  return postJSON('/gonkd/jog', {axis: 'E', dist: mm, feed: 300}).catch(showErr);
 }
 function preheat(hotend, bed) { cmd('M104 S' + hotend).catch(showErr); cmd('M140 S' + bed).catch(showErr); }
 function cooldown() { cmd('M104 S0').catch(showErr); cmd('M140 S0').catch(showErr); }
 function fan(v) { cmd('M106 S' + v).catch(showErr); }
 function babystep(delta) {
-  postJSON('/forge/babystep', {deltaMm: delta}).then(() => {
+  postJSON('/gonkd/babystep', {deltaMm: delta}).then(() => {
     babyTotal += delta;
     document.getElementById('babyTotal').textContent = babyTotal.toFixed(3);
   }).catch(showErr);
 }
-function babystepSave() { postJSON('/forge/babystep', {save: true}).catch(showErr); }
-function jobPause() { postJSON('/forge/job/pause').catch(showErr); }
-function jobResume() { postJSON('/forge/job/resume').catch(showErr); }
-function jobCancel() { if (confirm('Cancel the current job?')) postJSON('/forge/job/cancel').catch(showErr); }
-function estop() { if (confirm('EMERGENCY STOP the printer now?')) postJSON('/forge/emergency').catch(showErr); }
+function babystepSave() { postJSON('/gonkd/babystep', {save: true}).catch(showErr); }
+function jobPause() { postJSON('/gonkd/job/pause').catch(showErr); }
+function jobResume() { postJSON('/gonkd/job/resume').catch(showErr); }
+function jobCancel() { if (confirm('Cancel the current job?')) postJSON('/gonkd/job/cancel').catch(showErr); }
+function estop() { if (confirm('EMERGENCY STOP the printer now?')) postJSON('/gonkd/emergency').catch(showErr); }
 function sendCmd() {
   const el = document.getElementById('cmdInput');
   if (!el.value.trim()) return;
@@ -224,7 +224,7 @@ function setDisconnected(disc) {
 }
 
 function refresh() {
-  api('/forge/status').then(s => {
+  api('/gonkd/status').then(s => {
     document.getElementById('stateText').textContent = s.state || '';
     const dot = document.getElementById('statusDot');
     dot.className = 'dot ' + (s.state === 'error' ? 'err' : (s.connected ? 'ok' : ''));
@@ -273,7 +273,7 @@ function refresh() {
     setDisconnected(true);
   });
 
-  api('/forge/console').then(c => {
+  api('/gonkd/console').then(c => {
     const el = document.getElementById('console');
     el.textContent = (c.lines || []).join('\n');
     el.scrollTop = el.scrollHeight;
@@ -314,16 +314,16 @@ function renderFiles(files) {
 }
 
 function refreshFiles(force) {
-  api('/forge/files' + (force ? '?refresh=1' : '')).then(r => {
+  api('/gonkd/files' + (force ? '?refresh=1' : '')).then(r => {
     renderFiles(r.files || []);
   }).catch(() => {});
 }
 function printFile(short) {
-  postJSON('/forge/job/print', {name: short}).catch(showErr);
+  postJSON('/gonkd/job/print', {name: short}).catch(showErr);
 }
 function deleteFile(short) {
   if (!confirm('Delete ' + short + '?')) return;
-  postJSON('/forge/files/delete', {name: short})
+  postJSON('/gonkd/files/delete', {name: short})
     .then(() => refreshFiles(true))
     .catch(showErr);
 }

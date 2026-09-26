@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"forge/internal/serial"
+	"github.com/Xoltox/gonkd/internal/serial"
 )
 
 // Link keeps a Driver connected to the printer: it opens the port when it
@@ -67,7 +67,7 @@ func (l *Link) Run(ctx context.Context) {
 	lastMsg := "" // log each distinct failure once, not every retry
 	logOnce := func(msg string) {
 		if msg != lastMsg {
-			log.Printf("forge: %s", msg)
+			log.Printf("gonkd: %s", msg)
 			lastMsg = msg
 		}
 	}
@@ -85,12 +85,12 @@ func (l *Link) Run(ctx context.Context) {
 		l.mgr.Attach(d)
 		d.Start()
 		lastMsg = ""
-		log.Printf("forge: printer connected on %s", l.port)
+		log.Printf("gonkd: printer connected on %s", l.port)
 		start := time.Now()
 		reason := l.supervise(ctx, d)
 		d.Close()
 		l.mgr.Detach(reason)
-		log.Printf("forge: printer disconnected: %s", reason)
+		log.Printf("gonkd: printer disconnected: %s", reason)
 		if ctx.Err() != nil {
 			return
 		}

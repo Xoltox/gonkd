@@ -87,7 +87,7 @@ func ParseSDStatus(line string) (SDStatus, bool) {
 //	SUBDIR/PART.GCO 99 Sub Dir/part.gcode
 //	End file list
 //
-// Subdirectory entries (anything containing "/") are skipped: forge only
+// Subdirectory entries (anything containing "/") are skipped: gonkd only
 // prints and uploads in the card root. Only 8.3-shaped short names are
 // accepted, so an autoreport or "ok" line interleaved with a long listing
 // is never mistaken for a file.
