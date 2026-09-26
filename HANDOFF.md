@@ -12,7 +12,7 @@
 ## HARD CONSTRAINTS (read before coding)
 
 - **Host box**: Creality Wi-Fi Box v1 (WB-01), MediaTek MT7628 580MHz MIPS32 little-endian, NO FPU, 128MB RAM (~58MB idle), OpenWrt 24.10.4 (kernel 6.6), musl.
-- **Build**: `CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath -ldflags "-s -w" -o forge ./cmd/forge`. Static binary only; stdlib + golang.org/x/sys; no cgo, no heavy deps.
+- **Build**: `CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath -ldflags "-s -w" -o forge.mipsle ./cmd/forge`. Static binary only; stdlib + golang.org/x/sys; no cgo, no heavy deps.
 - **Storage**: box has no SD card (microSD is in printer). Root is jffs2 flash, 7.9MB total; ~4.8MB free after install. Binary 7.08MB raw (~2.6MB in jffs2). **Binary size is a hard budget** -- watch it. Avoid frequent flash writes (wear): only small config/names.json writes, on change. Staged uploads go to /tmp (tmpfs ~60MB) -- upload cap default 40MB.
 - **Memory**: target under ~15MB RSS; GC percent lowered.
 - **Freezes**: box experiences unpredictable whole-OS freezes of 0.4-0.75s duration (observed under Klipper, independent of load; root cause unknown, no kernel log entries, no paging). This is WHY Klipper was abandoned. Timing-critical work must stay on the printer MCU. **SD-upload mode is freeze-proof once printing** (freezes only slow the upload). **Stream mode survives freezes only via Marlin buffers** (64 planner blocks + 16 queued commands + 2048-byte RX): fine on long moves, may pause and leave a blob on dense short segments. Arc fitting in Orca helps. Never add host-side realtime requirements or heavy polling.
@@ -80,7 +80,7 @@ forge accepts these CLI flags (defaults shown; see files/forge.init):
 go vet ./...
 go test ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build \
-  -trimpath -ldflags "-s -w" -o forge ./cmd/forge
+  -trimpath -ldflags "-s -w" -o forge.mipsle ./cmd/forge
 ```
 Produces ~7.0MB static mipsle ELF (binary 7.08MB raw, ~2.6MB in jffs2).
 
@@ -126,7 +126,7 @@ Go module path is separate; doesn't need to match binary name but requires find-
 | Restart service | `ssh printbox /etc/init.d/forge restart` |
 | Verify running | `ssh printbox 'pgrep -l forge'` |
 | Test API | `curl http://<box-ip>/api/version` |
-| Build (local) | `CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath -ldflags "-s -w" -o forge ./cmd/forge` |
+| Build (local) | `CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath -ldflags "-s -w" -o forge.mipsle ./cmd/forge` |
 | Deploy | `scp -O forge.mipsle printbox:/tmp/forge.new && ssh printbox 'mv /tmp/forge.new /usr/bin/forge && /etc/init.d/forge restart'` |
 | Check jffs2 usage | `ssh printbox 'df -h /etc/forge'` |
 | Raw printer command | web UI console at http://<box-ip> |
@@ -135,15 +135,15 @@ Go module path is separate; doesn't need to match binary name but requires find-
 
 **Binary transfer fails / falls back to ASCII**: binary handshake likely failed due to bad packet framing or CRC mismatch. Check: (1) Marlin BINARY_FILE_TRANSFER is actually enabled in compiled firmware; (2) heatshrink window/lookahead params match Marlin source src/feature/binary_stream.h; (3) baud rate matches exactly (250000 on both sides). Enable debug logging in binprotocol.go if needed.
 
-**Upload hangs or times out**: check /tmp/forge free space (must be >file size + overhead). If stream mode: OS freezes may cause buffering issues (box freeze pauses read, Marlin RX buffer fills, timeout). SD-upload mode has no timeout per se; if stuck, check dmesg for TX CRC errors or packet loss.
+**Upload hangs or fails**: check /tmp free space (`df -h /tmp`) and the 40MB cap; `logread -e forge`. In stream mode a box freeze only pauses sending; Marlin buffers absorb short freezes.
 
-**Printer disconnects / goes offline**: check dmesg on box for CH340 driver errors; USB cable might be loose or power-starved. procd respawn will attempt restart (up to 5 fast failures then back off). No auto-reconnect yet (planned).
+**Printer offline**: printer must be powered and USB plugged in before forge starts (no reconnect yet). Check `ls /dev/ttyUSB*` and `dmesg | tail`, then `/etc/init.d/forge restart`. procd respawn gives up after 5 fast failures.
 
-**File list shows no files or wrong names**: M20 L parsing is sensitive to exact Marlin output format. Check `ssh printbox 'echo "M20 L" | nc localhost 80'` or logread for parse errors. If 8.3 names look corrupted, check /etc/forge/names.json format.
+**File list empty or wrong names**: M20 L parsing depends on exact Marlin output; check logread and the console output of `M20 L`. Name map is /etc/forge/names.json.
 
-**Web UI not responding**: SSH to box, check `ps aux | grep forge` (process alive?), `logread -e forge` (errors?), `curl http://localhost/api/version` (API OK?). If API OK but web not loading, check browser console for JS errors.
+**Web UI not responding**: on the box: `pgrep -l forge`, `logread -e forge`, `curl http://127.0.0.1/api/version`. If the API answers, check the browser console.
 
-**Binary size grew too large**: binary size is non-negotiable (~7MB raw, ~2.6MB compressed). Each new dep or heavy function hurts. Profile with `go test -bench` and analyze with `go tool nm`. Prefer pure-Go libs; no cgo allowed.
+**Binary grew too large**: size is a hard budget (flash). Keep deps minimal; inspect with `go version -m` and `go tool nm -size -sort size` on an unstripped build.
 
 ## Related History
 
