@@ -10,3 +10,8 @@
 
 # Local scratch
 /tmp/
+/gonkd
+*.mipsle
+
+# Private working notes (never publish)
+notes/
