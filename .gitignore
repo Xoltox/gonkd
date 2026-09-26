@@ -1,0 +1,12 @@
+# Build outputs
+/forge
+/forge.mipsle
+*.bin
+*.exe
+*.test
+
+# Go
+/vendor/
+
+# Local scratch
+/tmp/

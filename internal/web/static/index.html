@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>forge</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: #14161a; color: #e8e8e8;
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; }
+  .dot.ok { background: #3ecf5f; }
+  .dot.err { background: #e5484d; }
+  .card {
+    background: #1e2126; border: 1px solid #2c3038; border-radius: 10px;
+    padding: 12px; margin-bottom: 12px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
+    color: #9aa4b2; margin: 0 0 10px; }
+  .temps { display: flex; gap: 16px; flex-wrap: wrap; }
+  .temp { flex: 1; min-width: 120px; }
+  .temp .val { font-size: 22px; font-weight: 600; }
+  .temp .lbl { font-size: 12px; color: #9aa4b2; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  button {
+    background: #2c3038; color: #e8e8e8; border: 1px solid #3a3f4a;
+    border-radius: 8px; padding: 10px 8px; font-size: 14px; cursor: pointer;
+  }
+  button:active { background: #3a3f4a; }
+  button.primary { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+  button.danger { background: #b23a3a; border-color: #b23a3a; color: #fff; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .row { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+  .jogpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-width: 260px; }
+  .progress-outer { background: #2c3038; border-radius: 6px; height: 10px; overflow: hidden; margin: 8px 0; }
+  .progress-inner { background: #2d6cdf; height: 100%; width: 0%; transition: width .3s; }
+  .filelist { max-height: 200px; overflow-y: auto; }
+  .filerow { display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 0; border-bottom: 1px solid #2c3038; gap: 6px; }
+  .filerow .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  #console { background: #0c0d10; border-radius: 8px; padding: 8px; height: 160px;
+    overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; }
+  input[type=text] {
+    background: #14161a; border: 1px solid #3a3f4a; color: #e8e8e8; border-radius: 8px;
+    padding: 8px; font-size: 14px; width: 100%;
+  }
+  .small { font-size: 12px; color: #9aa4b2; }
+  select { background: #14161a; color: #e8e8e8; border: 1px solid #3a3f4a; border-radius: 8px; padding: 8px; }
+</style>
+</head>
+<body>
+<h1><span id="statusDot" class="dot"></span> forge <span class="small" id="stateText"></span></h1>
+
+<div class="card">
+  <h2>Temperatures</h2>
+  <div class="temps">
+    <div class="temp"><div class="val" id="hotendVal">-- / --</div><div class="lbl">Hotend &deg;C</div></div>
+    <div class="temp"><div class="val" id="bedVal">-- / --</div><div class="lbl">Bed &deg;C</div></div>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button onclick="preheat(200,60)">PLA 200/60</button>
+    <button onclick="preheat(235,80)">PETG 235/80</button>
+    <button onclick="cooldown()">Cooldown</button>
+    <button onclick="fan(255)">Fan On</button>
+    <button onclick="fan(0)">Fan Off</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Job</h2>
+  <div id="jobName" class="small">No active job</div>
+  <div class="progress-outer"><div class="progress-inner" id="jobBar"></div></div>
+  <div class="small" id="jobMeta"></div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnPause" onclick="jobPause()">Pause</button>
+    <button id="btnResume" onclick="jobResume()">Resume</button>
+    <button class="danger" onclick="jobCancel()">Cancel</button>
+    <button class="danger" onclick="estop()">EMERGENCY STOP</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Move</h2>
+  <div class="row"><button onclick="cmd('G28')">Home All</button>
+    <button onclick="cmd('G28 X Y')">Home XY</button>
+    <button onclick="cmd('G28 Z')">Home Z</button></div>
+  <div class="row small">Jog step:
+    <select id="jogStep"><option>0.1</option><option selected>1</option><option>10</option></select> mm
+  </div>
+  <div class="jogpad">
+    <span></span><button onclick="jog('Y',1)">Y+</button><span></span>
+    <button onclick="jog('X',-1)">X-</button><button onclick="jog('Z',1)">Z+</button><button onclick="jog('X',1)">X+</button>
+    <span></span><button onclick="jog('Y',-1)">Y-</button><span></span>
+    <span></span><button onclick="jog('Z',-1)">Z-</button><span></span>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnExtrude" onclick="extrude(5)">Extrude 5mm</button>
+    <button id="btnRetract" onclick="extrude(-5)">Retract 5mm</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Z Babystep</h2>
+  <div class="row">
+    <button onclick="babystep(-0.05)">-0.05</button>
+    <button onclick="babystep(-0.01)">-0.01</button>
+    <button onclick="babystep(0.01)">+0.01</button>
+    <button onclick="babystep(0.05)">+0.05</button>
+  </div>
+  <div class="small">Total this session: <span id="babyTotal">0.000</span> mm</div>
+  <div class="row" style="margin-top:6px"><button class="primary" onclick="babystepSave()">Save (M500)</button></div>
+</div>
+
+<div class="card">
+  <h2>SD Files</h2>
+  <div class="filelist" id="filelist"><div class="small">Loading...</div></div>
+  <div class="row" style="margin-top:8px">
+    <input type="file" id="uploadFile" style="flex:1">
+    <select id="uploadMode"><option value="sd">Upload to SD</option><option value="stream">Stream</option></select>
+    <button class="primary" onclick="doUpload(true)">Upload &amp; Print</button>
+    <button onclick="doUpload(false)">Upload Only</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Console</h2>
+  <div id="console"></div>
+  <div class="row" style="margin-top:8px">
+    <input type="text" id="cmdInput" placeholder="Send G-code..." onkeydown="if(event.key==='Enter')sendCmd()">
+    <button onclick="sendCmd()">Send</button>
+  </div>
+</div>
+
+<script>
+let babyTotal = 0;
+
+function api(path, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  return fetch(path, opts).then(r => { if (!r.ok) throw new Error(r.status); return r.status === 204 ? null : r.json(); });
+}
+function cmd(g) { return api('/forge/send', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({cmd:g})}); }
+
+function jog(axis, dir) {
+  const step = document.getElementById('jogStep').value;
+  const dist = (parseFloat(step) * dir).toFixed(3);
+  cmd('G91');
+  cmd(`G1 ${axis}${dist} F1500`);
+  cmd('G90');
+}
+function extrude(mm) { cmd('G91'); cmd(`G1 E${mm} F300`); cmd('G90'); }
+function preheat(hotend, bed) { cmd(`M104 S${hotend}`); cmd(`M140 S${bed}`); }
+function cooldown() { cmd('M104 S0'); cmd('M140 S0'); }
+function fan(v) { cmd(`M106 S${v}`); }
+function babystep(delta) {
+  babyTotal += delta;
+  document.getElementById('babyTotal').textContent = babyTotal.toFixed(3);
+  api('/forge/babystep', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({deltaMm: delta})});
+}
+function babystepSave() { api('/forge/babystep', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({save:true})}); }
+function jobPause() { api('/forge/job/pause', {method:'POST'}); }
+function jobResume() { api('/forge/job/resume', {method:'POST'}); }
+function jobCancel() { if (confirm('Cancel the current job?')) api('/forge/job/cancel', {method:'POST'}); }
+function estop() { if (confirm('EMERGENCY STOP the printer now?')) api('/forge/emergency', {method:'POST'}); }
+function sendCmd() {
+  const el = document.getElementById('cmdInput');
+  if (!el.value.trim()) return;
+  cmd(el.value.trim());
+  el.value = '';
+}
+function doUpload(print) {
+  const f = document.getElementById('uploadFile').files[0];
+  if (!f) { alert('choose a file first'); return; }
+  const mode = document.getElementById('uploadMode').value;
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('print', print ? 'true' : 'false');
+  fetch(`/api/files/local?mode=${mode}`, {method:'POST', body: fd})
+    .then(r => { if (!r.ok) return r.text().then(t => { throw new Error(t); }); return r.json(); })
+    .then(() => refresh())
+    .catch(e => alert('upload failed: ' + e.message));
+}
+
+function fmtTemp(v) { return (v === undefined || v === null) ? '--' : v.toFixed(1); }
+
+function refresh() {
+  api('/forge/status').then(s => {
+    document.getElementById('stateText').textContent = s.state || '';
+    const dot = document.getElementById('statusDot');
+    dot.className = 'dot ' + (s.state === 'error' ? 'err' : (s.connected ? 'ok' : ''));
+    const t = s.temps || {};
+    document.getElementById('hotendVal').textContent = fmtTemp(t.HotendActual) + ' / ' + fmtTemp(t.HotendTarget);
+    document.getElementById('bedVal').textContent = fmtTemp(t.BedActual) + ' / ' + fmtTemp(t.BedTarget);
+
+    const hot = (t.HotendActual || 0) > 170;
+    document.getElementById('btnExtrude').disabled = !hot;
+    document.getElementById('btnRetract').disabled = !hot;
+
+    if (s.job) {
+      document.getElementById('jobName').textContent = s.job.filename + ' (' + s.job.mode + ')';
+      document.getElementById('jobBar').style.width = (s.job.progress || 0).toFixed(1) + '%';
+      document.getElementById('jobMeta').textContent =
+        (s.job.progress||0).toFixed(1) + '%  elapsed ' + Math.round(s.job.elapsedSec||0) + 's  eta ' + Math.round(s.job.etaSec||0) + 's';
+    } else {
+      document.getElementById('jobName').textContent = 'No active job';
+      document.getElementById('jobBar').style.width = '0%';
+      document.getElementById('jobMeta').textContent = '';
+    }
+    const paused = s.state === 'paused';
+    document.getElementById('btnPause').style.display = paused ? 'none' : '';
+    document.getElementById('btnResume').style.display = paused ? '' : 'none';
+  }).catch(() => {
+    document.getElementById('statusDot').className = 'dot err';
+  });
+
+  api('/forge/console').then(c => {
+    const el = document.getElementById('console');
+    el.textContent = (c.lines || []).join('\n');
+    el.scrollTop = el.scrollHeight;
+  }).catch(() => {});
+}
+
+function refreshFiles(force) {
+  api('/forge/files' + (force ? '?refresh=1' : '')).then(r => {
+    const el = document.getElementById('filelist');
+    const files = r.files || [];
+    if (files.length === 0) { el.innerHTML = '<div class="small">No files (or not yet refreshed)</div>'; return; }
+    el.innerHTML = files.map(f => `
+      <div class="filerow">
+        <span class="name">${(f.long || f.short)}</span>
+        <button onclick="printFile('${f.short}')">Print</button>
+        <button onclick="deleteFile('${f.short}')">Del</button>
+      </div>`).join('');
+  }).catch(() => {});
+}
+function printFile(short) { cmd('M23 ' + short); cmd('M24'); }
+function deleteFile(short) {
+  if (!confirm('Delete ' + short + '?')) return;
+  api('/forge/files/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: short})})
+    .then(() => refreshFiles(true));
+}
+
+refresh();
+refreshFiles(true);
+setInterval(refresh, 2000);
+setInterval(function(){ refreshFiles(true); }, 10000);
+</script>
+</body>
+</html>
