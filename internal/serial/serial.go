@@ -53,16 +53,27 @@ type Port struct {
 // Open opens path (e.g. "/dev/ttyUSB0"), configures it for raw 8N1 at the
 // given baud rate using termios2/BOTHER, and returns a ready-to-use Port.
 func Open(path string, baud int) (*Port, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|unix.O_NOCTTY, 0)
+	// O_NONBLOCK makes os.File register the fd with Go's poller, which is
+	// what lets SetReadDeadline work. Never call f.Fd() on it: that flips the
+	// descriptor back to blocking mode and deadlines stop firing.
+	f, err := os.OpenFile(path, os.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("serial: open %s: %w", path, err)
 	}
-	fd := int(f.Fd())
-
-	t, err := unix.IoctlGetTermios(fd, unix.TCGETS2)
+	rc, err := f.SyscallConn()
 	if err != nil {
 		f.Close()
-		return nil, fmt.Errorf("serial: TCGETS2: %w", err)
+		return nil, fmt.Errorf("serial: %w", err)
+	}
+
+	var t *unix.Termios
+	var ioErr error
+	if err := rc.Control(func(fd uintptr) { t, ioErr = unix.IoctlGetTermios(int(fd), unix.TCGETS2) }); err != nil {
+		ioErr = err
+	}
+	if ioErr != nil {
+		f.Close()
+		return nil, fmt.Errorf("serial: TCGETS2: %w", ioErr)
 	}
 
 	// Raw mode: no canonical line editing, no echo, no signal chars, no
@@ -87,9 +98,12 @@ func Open(path string, baud int) (*Port, error) {
 	t.Cc[unix.VMIN] = 1
 	t.Cc[unix.VTIME] = 0
 
-	if err := unix.IoctlSetTermios(fd, unix.TCSETS2, t); err != nil {
+	if err := rc.Control(func(fd uintptr) { ioErr = unix.IoctlSetTermios(int(fd), unix.TCSETS2, t) }); err != nil {
+		ioErr = err
+	}
+	if ioErr != nil {
 		f.Close()
-		return nil, fmt.Errorf("serial: TCSETS2: %w", err)
+		return nil, fmt.Errorf("serial: TCSETS2: %w", ioErr)
 	}
 
 	return &Port{f: f}, nil
@@ -107,9 +121,19 @@ func (p *Port) SetReadDeadline(t time.Time) error { return p.f.SetReadDeadline(t
 // reset pin -- so opening the port commonly reboots Marlin. Callers should
 // expect a "start" banner after Open and wait for it (see internal/printer).
 func (p *Port) SetDTR(on bool) error {
-	bits := unix.TIOCM_DTR
+	req := uint(unix.TIOCMBIC)
 	if on {
-		return unix.IoctlSetPointerInt(int(p.f.Fd()), unix.TIOCMBIS, bits)
+		req = unix.TIOCMBIS
 	}
-	return unix.IoctlSetPointerInt(int(p.f.Fd()), unix.TIOCMBIC, bits)
+	rc, err := p.f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var ioErr error
+	if err := rc.Control(func(fd uintptr) {
+		ioErr = unix.IoctlSetPointerInt(int(fd), req, unix.TIOCM_DTR)
+	}); err != nil {
+		return err
+	}
+	return ioErr
 }

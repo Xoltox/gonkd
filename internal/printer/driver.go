@@ -124,10 +124,12 @@ func (d *Driver) Handshake(timeout time.Duration) error {
 		}
 	}
 	_ = sawStart // informational only; we sync either way
-	d.window.Reset(1)
-	if _, err := d.conn.Write([]byte("N1 M110 N0*")); err != nil {
-		// best effort; fall through to the checksummed path below instead
+	// Clear the per-read deadline; left expired, every read in readLoop
+	// would fail immediately and nothing would ever be received.
+	if dl, ok := d.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = dl.SetReadDeadline(time.Time{})
 	}
+	d.window.Reset(1)
 	// Send a properly framed M110 N0 (resets Marlin's expected line number
 	// to 0 so the very next command is N1).
 	frame := gcode.FrameLine(1, "M110 N0")

@@ -12,6 +12,12 @@ import (
 	"forge/internal/heatshrink"
 )
 
+// BinaryTransferEnabled gates the binary upload path. Off until it is
+// reworked: it never sends "M28 B1" to switch Marlin into binary mode, and
+// it reads the port directly while readLoop is also reading it (bytes get
+// split between the two, and its read deadline is left set afterwards).
+var BinaryTransferEnabled = false
+
 // ProgressFunc is called periodically during upload/stream with 0..100.
 type ProgressFunc func(sentBytes, totalBytes int64)
 
@@ -31,6 +37,12 @@ func (d *Driver) UploadToSD(ctx context.Context, localPath, longName string, nam
 	}
 	size := info.Size()
 
+	if !BinaryTransferEnabled {
+		if err := d.uploadASCII(ctx, localPath, short, size, progress); err != nil {
+			return "", err
+		}
+		return short, nil
+	}
 	if err := d.uploadBinary(ctx, localPath, short, size, progress); err == nil {
 		return short, nil
 	} else {
