@@ -66,7 +66,8 @@ func (m *NameMap) Save() error {
 		return err
 	}
 	tmp := m.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := writeSynced(tmp, data); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, m.path); err != nil {
@@ -74,6 +75,24 @@ func (m *NameMap) Save() error {
 	}
 	m.dirty = false
 	return nil
+}
+
+// writeSynced writes data to path and fsyncs it before returning, so a power
+// loss on jffs2 cannot leave the renamed file empty (SEC-33).
+func writeSynced(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // LongFor returns the remembered long name for a short (8.3) name, or the
@@ -90,11 +109,21 @@ func (m *NameMap) LongFor(short string) string {
 // Assign picks (and remembers) an 8.3 short name for a long name, avoiding
 // collisions with names already known to this map.
 func (m *NameMap) Assign(long string) string {
+	return m.AssignAvoiding(long, nil)
+}
+
+// AssignAvoiding is Assign that also skips any candidate for which taken
+// returns true, e.g. files already on the SD card that forge did not upload
+// (SEC-16). taken may be nil. It runs with the map's lock held, so it must
+// not call back into the NameMap.
+func (m *NameMap) AssignAvoiding(long string, taken func(string) bool) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	short := shortNameFor(long, func(candidate string) bool {
-		_, exists := m.entries[candidate]
-		return exists
+		if _, exists := m.entries[candidate]; exists {
+			return true
+		}
+		return taken != nil && taken(candidate)
 	})
 	m.entries[short] = NameEntry{Long: long, Short: short}
 	m.dirty = true
@@ -117,9 +146,15 @@ func (m *NameMap) Forget(short string) {
 // 3-char extension, with N bumped on collision.
 func shortNameFor(long string, taken func(string) bool) string {
 	base := filepath.Base(long)
-	ext := strings.ToUpper(strings.TrimPrefix(filepath.Ext(base), "."))
+	ext := sanitize83(strings.TrimPrefix(filepath.Ext(base), "."))
 	if len(ext) > 3 {
 		ext = ext[:3]
+	}
+	// Marlin only lists files whose extension starts with G, and anything
+	// odd here would make M28 and M23 target different names (SEC-16), so
+	// only the usual G-code spellings survive; everything else becomes GCO.
+	if ext != "G" && ext != "GCO" {
+		ext = "GCO"
 	}
 	name := strings.TrimSuffix(base, filepath.Ext(base))
 	name = sanitize83(name)

@@ -5,16 +5,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime/debug"
+	"strings"
+	"syscall"
 	"time"
 
 	"forge/internal/api"
 	"forge/internal/printer"
-	"forge/internal/serial"
 	"forge/internal/web"
 )
 
@@ -27,6 +30,7 @@ func main() {
 	maxUploadMB := flag.Int("max-upload-mb", 40, "reject uploads larger than this many MiB")
 	defaultMode := flag.String("default-mode", "sd", "default upload mode: sd or stream")
 	bufsize := flag.Int("bufsize", 16, "outstanding-line budget; match Marlin's BUFSIZE")
+	allowHost := flag.String("allow-host", "", "extra Host header values to accept, comma-separated (IP literals and localhost are always accepted)")
 	flag.Parse()
 
 	// This box has ~128MB RAM and no swap worth mentioning; a lower GC
@@ -38,41 +42,40 @@ func main() {
 	log.SetOutput(os.Stdout)
 	log.Printf("forge starting: port=%s baud=%d listen=%s mode=%s", *port, *baud, *listen, *defaultMode)
 
-	sp, err := serial.Open(*port, *baud)
-	if err != nil {
-		log.Fatalf("forge: opening %s: %v", *port, err)
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	drv := printer.New(sp, *bufsize)
 	names := printer.NewNameMap(*namesFile)
-	drv.SetNames(names)
-	drv.OnLine(func(string) {}) // console ring buffer is already recorded internally
+	mgr := printer.NewManager(names)
 
-	if err := drv.Handshake(5 * time.Second); err != nil {
-		log.Printf("forge: handshake warning: %v", err)
-	}
-	drv.Start()
+	// The printer may be off or unplugged; the link retries in the
+	// background and the HTTP server comes up regardless.
+	link := printer.NewLink(*port, *baud, *bufsize, names, mgr)
+	linkDone := make(chan struct{})
+	go func() {
+		link.Run(ctx)
+		close(linkDone)
+	}()
 
-	// Ask Marlin to keep us updated without polling: M155 for temps, M27 S
-	// for SD status, plus an M115 to learn capabilities and an initial
-	// M20 L to seed the file list.
-	drv.Send("M115")
-	drv.Send("M155 S2")
-	drv.Send("M27 S2")
-	drv.Send("M20 L")
-
-	mgr := printer.NewManager(drv, names)
 	mode := printer.UploadMode(*defaultMode)
 	if mode != printer.ModeSDUpload && mode != printer.ModeStream {
 		log.Printf("forge: unknown -default-mode %q, using sd", *defaultMode)
 		mode = printer.ModeSDUpload
 	}
 
+	var hosts []string
+	for _, h := range strings.Split(*allowHost, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+
 	srv := &api.Server{
-		Mgr:     mgr,
-		DataDir: *dataDir,
-		MaxBody: int64(*maxUploadMB) * 1 << 20,
-		Mode:    mode,
+		Mgr:        mgr,
+		DataDir:    *dataDir,
+		MaxBody:    int64(*maxUploadMB) << 20,
+		Mode:       mode,
+		AllowHosts: hosts,
 	}
 
 	mux := http.NewServeMux()
@@ -82,12 +85,27 @@ func main() {
 	httpSrv := &http.Server{
 		Addr:              *listen,
 		Handler:           mux,
-		ReadTimeout:       0, // uploads can be large/slow over USB-bridged serial boxes
+		ReadTimeout:       0, // uploads can be large and slow on this box's Wi-Fi
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(sctx)
+	}()
+
 	log.Printf("forge listening on %s", *listen)
-	if err := httpSrv.ListenAndServe(); err != nil {
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("forge: http server: %v", err)
 	}
+	// Let the link close the port cleanly (procd's term_timeout is 5s).
+	select {
+	case <-linkDone:
+	case <-time.After(2 * time.Second):
+	}
+	log.Printf("forge stopped")
 }

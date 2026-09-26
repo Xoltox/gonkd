@@ -4,23 +4,9 @@
 // 250000 is not one of the standard POSIX Bxxx termios speeds, so this uses
 // the Linux-specific termios2 / BOTHER mechanism (TCGETS2/TCSETS2 ioctls
 // with CBAUD replaced by BOTHER and Ispeed/Ospeed set directly) instead of
-// cfsetspeed. golang.org/x/sys/unix already generates a per-architecture
-// Termios struct and TCGETS2/TCSETS2/BOTHER/CBAUD/CBAUDEX ioctl numbers
-// (they differ between mipsle and amd64: e.g. TCGETS2 is 0x4030542a on
-// mipsle vs 0x802c542a on amd64), so unix.IoctlGetTermios/IoctlSetTermios
-// with those request codes work unmodified cross-arch.
-//
-// ASSUMPTION (documented, not verified against a real MT7628 kernel): the
-// non-baud raw-mode flags below (OPOST, ECHO, and the ISTRIP/ICRNL/etc.
-// family) use the values from Linux's original/generic termbits layout.
-// x/sys/unix's generated per-arch constants confirm CBAUD, CREAD, CLOCAL,
-// CS8, CSTOPB, PARENB, ISIG, ICANON, ECHONL and IEXTEN's *presence* differs
-// only slightly between mips and amd64 (IEXTEN's bit value differs: 0x100
-// vs 0x8000; everything else checked was identical), which is consistent
-// with MIPS Linux keeping the "original" POSIX termios bits (which include
-// OPOST and ECHO) at the same positions as every other Linux port and only
-// relocating the handful of extension flags added later. If raw mode
-// behaves oddly on the real box, this is the first thing to re-check.
+// cfsetspeed. golang.org/x/sys/unix generates the Termios struct, the ioctl
+// numbers and every flag constant per architecture (TCGETS2, TCFLSH and
+// IEXTEN differ between mipsle and amd64), so nothing here is hand-coded.
 package serial
 
 import (
@@ -31,21 +17,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const (
-	opost  = 0x1   // Oflag: output processing
-	echo   = 0x8   // Lflag: echo input
-	ignbrk = 0x1   // Iflag
-	brkint = 0x2   // Iflag
-	parmrk = 0x8   // Iflag
-	istrip = 0x20  // Iflag
-	inlcr  = 0x40  // Iflag
-	igncr  = 0x80  // Iflag
-	icrnl  = 0x100 // Iflag
-)
-
 // Port wraps an open, configured serial device. It implements
 // io.ReadWriteCloser and SetReadDeadline so it can be used directly by
-// internal/binprotocol and internal/gcode readers.
+// internal/printer.
 type Port struct {
 	f *os.File
 }
@@ -53,9 +27,11 @@ type Port struct {
 // Open opens path (e.g. "/dev/ttyUSB0"), configures it for raw 8N1 at the
 // given baud rate using termios2/BOTHER, and returns a ready-to-use Port.
 func Open(path string, baud int) (*Port, error) {
-	// O_NONBLOCK makes os.File register the fd with Go's poller, which is
-	// what lets SetReadDeadline work. Never call f.Fd() on it: that flips the
-	// descriptor back to blocking mode and deadlines stop firing.
+	// Deadlines (SetReadDeadline) work because os.OpenFile registers the tty
+	// with Go's runtime poller. The rule that keeps it that way: never call
+	// f.Fd() on this file. Fd() switches the descriptor back to blocking
+	// mode, after which reads ignore deadlines and Close cannot interrupt
+	// them. All ioctls go through SyscallConn().Control instead.
 	f, err := os.OpenFile(path, os.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("serial: open %s: %w", path, err)
@@ -79,11 +55,19 @@ func Open(path string, baud int) (*Port, error) {
 	// Raw mode: no canonical line editing, no echo, no signal chars, no
 	// input/output translation, 8 data bits, no parity, one stop bit,
 	// ignore modem control lines, enable receiver.
-	t.Iflag &^= ignbrk | brkint | parmrk | istrip | inlcr | igncr | icrnl | unix.IXON | unix.IXOFF
-	t.Oflag &^= opost
-	t.Lflag &^= unix.ICANON | echo | unix.ECHONL | unix.ISIG | unix.IEXTEN
+	t.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON | unix.IXOFF
+	t.Oflag &^= unix.OPOST
+	t.Lflag &^= unix.ICANON | unix.ECHO | unix.ECHONL | unix.ISIG | unix.IEXTEN
 	t.Cflag &^= unix.CSIZE | unix.PARENB | unix.CSTOPB
 	t.Cflag |= unix.CS8 | unix.CREAD | unix.CLOCAL
+
+	// Keep DTR asserted when the port is closed. With HUPCL set (the
+	// default) every close drops DTR, and the next open raises it again;
+	// the CH340 board wires DTR to the MCU reset, so a forge restart or
+	// reconnect would reset Marlin and kill a running SD print. The tty
+	// keeps this setting after close, so only the very first open after
+	// the USB device appears produces a DTR edge.
+	t.Cflag &^= unix.HUPCL
 
 	// Custom baud rate via BOTHER: clear the CBAUD field (and CBAUDEX,
 	// which is folded into CBAUD on Linux) and set it to BOTHER, then give
@@ -93,8 +77,9 @@ func Open(path string, baud int) (*Port, error) {
 	t.Ispeed = uint32(baud)
 	t.Ospeed = uint32(baud)
 
-	// VMIN/VTIME: block for at least 1 byte, no inter-byte timeout; forge's
-	// reader always wants complete lines/packets rather than partial reads.
+	// VMIN/VTIME: block for at least 1 byte, no inter-byte timeout. (Under
+	// the Go poller reads are non-blocking anyway; these only matter to a
+	// blocking reader.)
 	t.Cc[unix.VMIN] = 1
 	t.Cc[unix.VTIME] = 0
 
@@ -104,6 +89,16 @@ func Open(path string, baud int) (*Port, error) {
 	if ioErr != nil {
 		f.Close()
 		return nil, fmt.Errorf("serial: TCSETS2: %w", ioErr)
+	}
+
+	// Drop whatever arrived before we were listening (stale replies from
+	// a previous session, bootloader noise) so the handshake starts clean.
+	if err := rc.Control(func(fd uintptr) { ioErr = unix.IoctlSetInt(int(fd), unix.TCFLSH, unix.TCIFLUSH) }); err != nil {
+		ioErr = err
+	}
+	if ioErr != nil {
+		f.Close()
+		return nil, fmt.Errorf("serial: TCFLSH: %w", ioErr)
 	}
 
 	return &Port{f: f}, nil

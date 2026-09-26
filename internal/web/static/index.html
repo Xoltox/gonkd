@@ -12,10 +12,12 @@
     font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
     font-size: 15px;
   }
-  h1 { font-size: 18px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  h1 { font-size: 18px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; }
   .dot.ok { background: #3ecf5f; }
   .dot.err { background: #e5484d; }
+  #connMsg { font-size: 12px; color: #e5484d; margin: 0 0 12px; min-height: 14px; }
+  #errMsg { font-size: 12px; color: #e5484d; margin: 0 0 12px; min-height: 14px; white-space: pre-wrap; }
   .card {
     background: #1e2126; border: 1px solid #2c3038; border-radius: 10px;
     padding: 12px; margin-bottom: 12px;
@@ -52,10 +54,15 @@
   }
   .small { font-size: 12px; color: #9aa4b2; }
   select { background: #14161a; color: #e8e8e8; border: 1px solid #3a3f4a; border-radius: 8px; padding: 8px; }
+  fieldset { border: none; margin: 0; padding: 0; }
 </style>
 </head>
 <body>
 <h1><span id="statusDot" class="dot"></span> forge <span class="small" id="stateText"></span></h1>
+<div id="connMsg"></div>
+<div id="errMsg"></div>
+
+<fieldset id="controls">
 
 <div class="card">
   <h2>Temperatures</h2>
@@ -64,11 +71,11 @@
     <div class="temp"><div class="val" id="bedVal">-- / --</div><div class="lbl">Bed &deg;C</div></div>
   </div>
   <div class="row" style="margin-top:10px">
-    <button onclick="preheat(200,60)">PLA 200/60</button>
-    <button onclick="preheat(235,80)">PETG 235/80</button>
-    <button onclick="cooldown()">Cooldown</button>
-    <button onclick="fan(255)">Fan On</button>
-    <button onclick="fan(0)">Fan Off</button>
+    <button data-act="preheat-pla">PLA 200/60</button>
+    <button data-act="preheat-petg">PETG 235/80</button>
+    <button data-act="cooldown">Cooldown</button>
+    <button data-act="fan-on">Fan On</button>
+    <button data-act="fan-off">Fan Off</button>
   </div>
 </div>
 
@@ -78,43 +85,44 @@
   <div class="progress-outer"><div class="progress-inner" id="jobBar"></div></div>
   <div class="small" id="jobMeta"></div>
   <div class="row" style="margin-top:8px">
-    <button id="btnPause" onclick="jobPause()">Pause</button>
-    <button id="btnResume" onclick="jobResume()">Resume</button>
-    <button class="danger" onclick="jobCancel()">Cancel</button>
-    <button class="danger" onclick="estop()">EMERGENCY STOP</button>
+    <button id="btnPause" data-act="job-pause">Pause</button>
+    <button id="btnResume" data-act="job-resume">Resume</button>
+    <button class="danger" data-act="job-cancel">Cancel</button>
+    <button class="danger" data-act="estop">EMERGENCY STOP</button>
   </div>
 </div>
 
 <div class="card">
   <h2>Move</h2>
-  <div class="row"><button onclick="cmd('G28')">Home All</button>
-    <button onclick="cmd('G28 X Y')">Home XY</button>
-    <button onclick="cmd('G28 Z')">Home Z</button></div>
+  <div class="small" id="jobLockMsg"></div>
+  <div class="row"><button class="joblock" data-cmd="G28">Home All</button>
+    <button class="joblock" data-cmd="G28 X Y">Home XY</button>
+    <button class="joblock" data-cmd="G28 Z">Home Z</button></div>
   <div class="row small">Jog step:
     <select id="jogStep"><option>0.1</option><option selected>1</option><option>10</option></select> mm
   </div>
   <div class="jogpad">
-    <span></span><button onclick="jog('Y',1)">Y+</button><span></span>
-    <button onclick="jog('X',-1)">X-</button><button onclick="jog('Z',1)">Z+</button><button onclick="jog('X',1)">X+</button>
-    <span></span><button onclick="jog('Y',-1)">Y-</button><span></span>
-    <span></span><button onclick="jog('Z',-1)">Z-</button><span></span>
+    <span></span><button class="joblock" data-jog="Y,1">Y+</button><span></span>
+    <button class="joblock" data-jog="X,-1">X-</button><button class="joblock" data-jog="Z,1">Z+</button><button class="joblock" data-jog="X,1">X+</button>
+    <span></span><button class="joblock" data-jog="Y,-1">Y-</button><span></span>
+    <span></span><button class="joblock" data-jog="Z,-1">Z-</button><span></span>
   </div>
   <div class="row" style="margin-top:8px">
-    <button id="btnExtrude" onclick="extrude(5)">Extrude 5mm</button>
-    <button id="btnRetract" onclick="extrude(-5)">Retract 5mm</button>
+    <button id="btnExtrude" class="joblock" data-extrude="5">Extrude 5mm</button>
+    <button id="btnRetract" class="joblock" data-extrude="-5">Retract 5mm</button>
   </div>
 </div>
 
 <div class="card">
   <h2>Z Babystep</h2>
   <div class="row">
-    <button onclick="babystep(-0.05)">-0.05</button>
-    <button onclick="babystep(-0.01)">-0.01</button>
-    <button onclick="babystep(0.01)">+0.01</button>
-    <button onclick="babystep(0.05)">+0.05</button>
+    <button data-baby="-0.05">-0.05</button>
+    <button data-baby="-0.01">-0.01</button>
+    <button data-baby="0.01">+0.01</button>
+    <button data-baby="0.05">+0.05</button>
   </div>
   <div class="small">Total this session: <span id="babyTotal">0.000</span> mm</div>
-  <div class="row" style="margin-top:6px"><button class="primary" onclick="babystepSave()">Save (M500)</button></div>
+  <div class="row" style="margin-top:6px"><button class="primary joblock" data-act="baby-save">Save (M500)</button></div>
 </div>
 
 <div class="card">
@@ -123,57 +131,75 @@
   <div class="row" style="margin-top:8px">
     <input type="file" id="uploadFile" style="flex:1">
     <select id="uploadMode"><option value="sd">Upload to SD</option><option value="stream">Stream</option></select>
-    <button class="primary" onclick="doUpload(true)">Upload &amp; Print</button>
-    <button onclick="doUpload(false)">Upload Only</button>
+    <button class="primary" data-act="upload-print">Upload &amp; Print</button>
+    <button data-act="upload-only">Upload Only</button>
   </div>
+  <div class="small" id="uploadStatus"></div>
 </div>
 
 <div class="card">
   <h2>Console</h2>
   <div id="console"></div>
   <div class="row" style="margin-top:8px">
-    <input type="text" id="cmdInput" placeholder="Send G-code..." onkeydown="if(event.key==='Enter')sendCmd()">
-    <button onclick="sendCmd()">Send</button>
+    <input type="text" id="cmdInput" placeholder="Send G-code...">
+    <button data-act="send-cmd">Send</button>
   </div>
 </div>
 
+</fieldset>
+
 <script>
+'use strict';
 let babyTotal = 0;
+let lastState = null;
 
 function api(path, opts) {
   opts = opts || {};
   opts.headers = opts.headers || {};
-  return fetch(path, opts).then(r => { if (!r.ok) throw new Error(r.status); return r.status === 204 ? null : r.json(); });
+  return fetch(path, opts).then(r => {
+    if (!r.ok) return r.text().then(t => { throw new Error(t || ('HTTP ' + r.status)); });
+    return r.status === 204 ? null : r.json();
+  });
 }
-function cmd(g) { return api('/forge/send', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({cmd:g})}); }
+function postJSON(path, body) {
+  return api(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
+}
+function cmd(g) { return postJSON('/forge/send', {cmd: g}); }
 
 function jog(axis, dir) {
   const step = document.getElementById('jogStep').value;
-  const dist = (parseFloat(step) * dir).toFixed(3);
-  cmd('G91');
-  cmd(`G1 ${axis}${dist} F1500`);
-  cmd('G90');
+  const dist = parseFloat(step) * dir;
+  return postJSON('/forge/jog', {axis: axis, dist: dist, feed: 3000}).catch(showErr);
 }
-function extrude(mm) { cmd('G91'); cmd(`G1 E${mm} F300`); cmd('G90'); }
-function preheat(hotend, bed) { cmd(`M104 S${hotend}`); cmd(`M140 S${bed}`); }
-function cooldown() { cmd('M104 S0'); cmd('M140 S0'); }
-function fan(v) { cmd(`M106 S${v}`); }
+// Extrude/retract always move a fixed amount of filament, independent of
+// the XYZ jog step selector (R-12: they used to be multiplied by it).
+function extrudeFixed(mm) {
+  return postJSON('/forge/jog', {axis: 'E', dist: mm, feed: 300}).catch(showErr);
+}
+function preheat(hotend, bed) { cmd('M104 S' + hotend).catch(showErr); cmd('M140 S' + bed).catch(showErr); }
+function cooldown() { cmd('M104 S0').catch(showErr); cmd('M140 S0').catch(showErr); }
+function fan(v) { cmd('M106 S' + v).catch(showErr); }
 function babystep(delta) {
-  babyTotal += delta;
-  document.getElementById('babyTotal').textContent = babyTotal.toFixed(3);
-  api('/forge/babystep', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({deltaMm: delta})});
+  postJSON('/forge/babystep', {deltaMm: delta}).then(() => {
+    babyTotal += delta;
+    document.getElementById('babyTotal').textContent = babyTotal.toFixed(3);
+  }).catch(showErr);
 }
-function babystepSave() { api('/forge/babystep', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({save:true})}); }
-function jobPause() { api('/forge/job/pause', {method:'POST'}); }
-function jobResume() { api('/forge/job/resume', {method:'POST'}); }
-function jobCancel() { if (confirm('Cancel the current job?')) api('/forge/job/cancel', {method:'POST'}); }
-function estop() { if (confirm('EMERGENCY STOP the printer now?')) api('/forge/emergency', {method:'POST'}); }
+function babystepSave() { postJSON('/forge/babystep', {save: true}).catch(showErr); }
+function jobPause() { postJSON('/forge/job/pause').catch(showErr); }
+function jobResume() { postJSON('/forge/job/resume').catch(showErr); }
+function jobCancel() { if (confirm('Cancel the current job?')) postJSON('/forge/job/cancel').catch(showErr); }
+function estop() { if (confirm('EMERGENCY STOP the printer now?')) postJSON('/forge/emergency').catch(showErr); }
 function sendCmd() {
   const el = document.getElementById('cmdInput');
   if (!el.value.trim()) return;
-  cmd(el.value.trim());
+  cmd(el.value.trim()).catch(showErr);
   el.value = '';
 }
+function showErr(e) {
+  document.getElementById('errMsg').textContent = e && e.message ? e.message : String(e);
+}
+
 function doUpload(print) {
   const f = document.getElementById('uploadFile').files[0];
   if (!f) { alert('choose a file first'); return; }
@@ -181,42 +207,70 @@ function doUpload(print) {
   const fd = new FormData();
   fd.append('file', f);
   fd.append('print', print ? 'true' : 'false');
-  fetch(`/api/files/local?mode=${mode}`, {method:'POST', body: fd})
+  const statusEl = document.getElementById('uploadStatus');
+  statusEl.textContent = 'Uploading...';
+  fetch('/api/files/local?mode=' + encodeURIComponent(mode), {method: 'POST', body: fd})
     .then(r => { if (!r.ok) return r.text().then(t => { throw new Error(t); }); return r.json(); })
-    .then(() => refresh())
-    .catch(e => alert('upload failed: ' + e.message));
+    .then(() => { statusEl.textContent = 'Upload accepted.'; refreshFiles(); })
+    .catch(e => { statusEl.textContent = ''; showErr(e); });
 }
 
 function fmtTemp(v) { return (v === undefined || v === null) ? '--' : v.toFixed(1); }
+
+function setDisconnected(disc) {
+  document.getElementById('connMsg').textContent = disc ? 'printer disconnected, retrying...' : '';
+  const els = document.querySelectorAll('#controls button');
+  els.forEach(function (b) { b.disabled = disc; });
+}
 
 function refresh() {
   api('/forge/status').then(s => {
     document.getElementById('stateText').textContent = s.state || '';
     const dot = document.getElementById('statusDot');
     dot.className = 'dot ' + (s.state === 'error' ? 'err' : (s.connected ? 'ok' : ''));
+    setDisconnected(!s.connected);
+    document.getElementById('errMsg').textContent = s.lastError || '';
+
     const t = s.temps || {};
     document.getElementById('hotendVal').textContent = fmtTemp(t.HotendActual) + ' / ' + fmtTemp(t.HotendTarget);
     document.getElementById('bedVal').textContent = fmtTemp(t.BedActual) + ' / ' + fmtTemp(t.BedTarget);
 
+    // Home/jog/extrude/M500 are disabled while a job owns the port
+    // (uploading/printing/paused): a stray click must not move the head or
+    // stall the MCU mid-print. Temps, babystep, pause/resume/cancel and
+    // E-stop stay enabled in that state.
+    const jobActive = s.state === 'uploading' || s.state === 'printing' || s.state === 'paused';
+    document.getElementById('jobLockMsg').textContent = (jobActive && s.connected) ? 'move disabled while a job is active' : '';
+    document.querySelectorAll('.joblock').forEach(function (b) {
+      b.disabled = !s.connected || jobActive;
+    });
     const hot = (t.HotendActual || 0) > 170;
-    document.getElementById('btnExtrude').disabled = !hot;
-    document.getElementById('btnRetract').disabled = !hot;
+    document.getElementById('btnExtrude').disabled = !hot || !s.connected || jobActive;
+    document.getElementById('btnRetract').disabled = !hot || !s.connected || jobActive;
 
     if (s.job) {
-      document.getElementById('jobName').textContent = s.job.filename + ' (' + s.job.mode + ')';
+      const label = s.state === 'uploading' ? 'uploading' : (s.job.mode || '');
+      document.getElementById('jobName').textContent = s.job.filename + ' (' + label + ')';
       document.getElementById('jobBar').style.width = (s.job.progress || 0).toFixed(1) + '%';
       document.getElementById('jobMeta').textContent =
-        (s.job.progress||0).toFixed(1) + '%  elapsed ' + Math.round(s.job.elapsedSec||0) + 's  eta ' + Math.round(s.job.etaSec||0) + 's';
+        (s.job.progress || 0).toFixed(1) + '%  elapsed ' + Math.round(s.job.elapsedSec || 0) + 's  eta ' + Math.round(s.job.etaSec || 0) + 's';
     } else {
       document.getElementById('jobName').textContent = 'No active job';
       document.getElementById('jobBar').style.width = '0%';
       document.getElementById('jobMeta').textContent = '';
     }
     const paused = s.state === 'paused';
-    document.getElementById('btnPause').style.display = paused ? 'none' : '';
+    const printing = s.state === 'printing';
+    document.getElementById('btnPause').style.display = printing ? '' : 'none';
     document.getElementById('btnResume').style.display = paused ? '' : 'none';
+
+    if (lastState !== 'idle' && s.state === 'idle') {
+      refreshFiles();
+    }
+    lastState = s.state;
   }).catch(() => {
     document.getElementById('statusDot').className = 'dot err';
+    setDisconnected(true);
   });
 
   api('/forge/console').then(c => {
@@ -226,30 +280,88 @@ function refresh() {
   }).catch(() => {});
 }
 
+function renderFiles(files) {
+  const el = document.getElementById('filelist');
+  while (el.firstChild) el.removeChild(el.firstChild);
+  if (!files || files.length === 0) {
+    const d = document.createElement('div');
+    d.className = 'small';
+    d.textContent = 'No files (or not yet refreshed)';
+    el.appendChild(d);
+    return;
+  }
+  files.forEach(function (f) {
+    const row = document.createElement('div');
+    row.className = 'filerow';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'name';
+    nameEl.textContent = f.long || f.short;
+    row.appendChild(nameEl);
+
+    const printBtn = document.createElement('button');
+    printBtn.textContent = 'Print';
+    printBtn.addEventListener('click', function () { printFile(f.short); });
+    row.appendChild(printBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.textContent = 'Del';
+    delBtn.addEventListener('click', function () { deleteFile(f.short); });
+    row.appendChild(delBtn);
+
+    el.appendChild(row);
+  });
+}
+
 function refreshFiles(force) {
   api('/forge/files' + (force ? '?refresh=1' : '')).then(r => {
-    const el = document.getElementById('filelist');
-    const files = r.files || [];
-    if (files.length === 0) { el.innerHTML = '<div class="small">No files (or not yet refreshed)</div>'; return; }
-    el.innerHTML = files.map(f => `
-      <div class="filerow">
-        <span class="name">${(f.long || f.short)}</span>
-        <button onclick="printFile('${f.short}')">Print</button>
-        <button onclick="deleteFile('${f.short}')">Del</button>
-      </div>`).join('');
+    renderFiles(r.files || []);
   }).catch(() => {});
 }
-function printFile(short) { cmd('M23 ' + short); cmd('M24'); }
+function printFile(short) {
+  postJSON('/forge/job/print', {name: short}).catch(showErr);
+}
 function deleteFile(short) {
   if (!confirm('Delete ' + short + '?')) return;
-  api('/forge/files/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: short})})
-    .then(() => refreshFiles(true));
+  postJSON('/forge/files/delete', {name: short})
+    .then(() => refreshFiles(true))
+    .catch(showErr);
 }
+
+document.getElementById('controls').addEventListener('click', function (ev) {
+  const b = ev.target.closest('button');
+  if (!b) return;
+  if (b.dataset.cmd) { cmd(b.dataset.cmd).catch(showErr); return; }
+  if (b.dataset.jog) {
+    const parts = b.dataset.jog.split(',');
+    jog(parts[0], parseFloat(parts[1]));
+    return;
+  }
+  if (b.dataset.extrude) { extrudeFixed(parseFloat(b.dataset.extrude)); return; }
+  if (b.dataset.baby) { babystep(parseFloat(b.dataset.baby)); return; }
+  switch (b.dataset.act) {
+    case 'preheat-pla': preheat(200, 60); break;
+    case 'preheat-petg': preheat(235, 80); break;
+    case 'cooldown': cooldown(); break;
+    case 'fan-on': fan(255); break;
+    case 'fan-off': fan(0); break;
+    case 'job-pause': jobPause(); break;
+    case 'job-resume': jobResume(); break;
+    case 'job-cancel': jobCancel(); break;
+    case 'estop': estop(); break;
+    case 'baby-save': babystepSave(); break;
+    case 'upload-print': doUpload(true); break;
+    case 'upload-only': doUpload(false); break;
+    case 'send-cmd': sendCmd(); break;
+  }
+});
+document.getElementById('cmdInput').addEventListener('keydown', function (ev) {
+  if (ev.key === 'Enter') sendCmd();
+});
 
 refresh();
 refreshFiles(true);
 setInterval(refresh, 2000);
-setInterval(function(){ refreshFiles(true); }, 10000);
 </script>
 </body>
 </html>

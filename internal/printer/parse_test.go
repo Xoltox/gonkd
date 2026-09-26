@@ -35,22 +35,65 @@ func TestParseSDStatusNotPrinting(t *testing.T) {
 	}
 }
 
-func TestParseFileListLine(t *testing.T) {
-	f, ok := ParseFileListLine(`BENCHY~1.GCO 123456 "Benchy Test.gcode"`)
-	if !ok {
-		t.Fatal("expected ok")
-	}
-	if f.Short != "BENCHY~1.GCO" || f.Bytes != 123456 || f.Long != "Benchy Test.gcode" {
-		t.Fatalf("f = %+v", f)
+func TestParseTempsAutoreportLeadingSpace(t *testing.T) {
+	temps, ok := ParseTemps(" T:20.00 /0.00 B:21.50 /0.00 @:0 B@:0\n")
+	if !ok || temps.HotendActual != 20 || temps.BedActual != 21.5 {
+		t.Fatalf("temps=%+v ok=%v", temps, ok)
 	}
 }
 
-func TestParseFileListLineSkipsHeaders(t *testing.T) {
-	if _, ok := ParseFileListLine("Begin file list"); ok {
-		t.Fatal("should skip header")
+func TestParseTempsM105Reply(t *testing.T) {
+	temps, ok := ParseTemps("ok T:210.00 /210.00 B:60.00 /60.00 @:127 B@:80")
+	if !ok || temps.HotendTarget != 210 || temps.BedTarget != 60 {
+		t.Fatalf("temps=%+v ok=%v", temps, ok)
 	}
-	if _, ok := ParseFileListLine("End file list"); ok {
-		t.Fatal("should skip footer")
+}
+
+func TestParseTempsIgnoresEmbeddedT(t *testing.T) {
+	for _, in := range []string{
+		"echo:Now fresh file: T:1.GCO",
+		"BENCHY~1.GCO 123 My T:1 B:2 part.gcode",
+		"ok N5 P15 B16",
+	} {
+		if _, ok := ParseTemps(in); ok {
+			t.Fatalf("%q must not parse as temps", in)
+		}
+	}
+}
+
+func TestParseFileListLineUnquotedLongName(t *testing.T) {
+	f, ok := ParseFileListLine("BENCHY~1.GCO 123456 Benchy Test.gcode\n")
+	if !ok || f.Short != "BENCHY~1.GCO" || f.Bytes != 123456 || f.Long != "Benchy Test.gcode" {
+		t.Fatalf("f=%+v ok=%v", f, ok)
+	}
+	f, ok = ParseFileListLine("cube.gco 2048 CUBE.GCO")
+	if !ok || f.Short != "CUBE.GCO" || f.Long != "CUBE.GCO" {
+		t.Fatalf("f=%+v ok=%v", f, ok)
+	}
+	f, ok = ParseFileListLine("NOEXT 10")
+	if !ok || f.Short != "NOEXT" || f.Long != "" {
+		t.Fatalf("f=%+v ok=%v", f, ok)
+	}
+}
+
+func TestParseFileListLineRejectsNonFiles(t *testing.T) {
+	for _, in := range []string{
+		"Begin file list",
+		"End file list",
+		"",
+		"T:210.00 /210.00 B:60.00 /60.00 @:127 B@:80",
+		" T:20.00 /0.00 B:20.00 /0.00 @:0 B@:0",
+		"ok N5 P15 B16",
+		"ok",
+		"SD printing byte 10/200",
+		"SUBDIR/PART.GCO 99 Sub Dir/part.gcode",
+		"TOOLONGNAME.GCO 10 x",
+		"NAME.GCODE 10 x",
+		"echo:busy: processing",
+	} {
+		if f, ok := ParseFileListLine(in); ok {
+			t.Fatalf("%q parsed as file %+v", in, f)
+		}
 	}
 }
 

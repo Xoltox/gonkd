@@ -45,23 +45,24 @@ type SDFile struct {
 
 // Job describes the currently active (or most recently finished) print.
 type Job struct {
-	Filename    string    `json:"filename"`
-	Mode        UploadMode `json:"mode"`
-	TotalBytes  int64     `json:"totalBytes"`
-	SentBytes   int64     `json:"sentBytes"`
-	Progress    float64   `json:"progress"` // 0..100
-	StartedAt   time.Time `json:"startedAt"`
-	ElapsedSec  float64   `json:"elapsedSec"`
-	ETASec      float64   `json:"etaSec"`
-	BabystepMM  float64   `json:"babystepMm"` // running total since last M500
+	Filename   string     `json:"filename"`
+	Mode       UploadMode `json:"mode"`
+	TotalBytes int64      `json:"totalBytes"`
+	SentBytes  int64      `json:"sentBytes"`
+	Progress   float64    `json:"progress"` // 0..100
+	StartedAt  time.Time  `json:"startedAt"`
+	ElapsedSec float64    `json:"elapsedSec"`
+	ETASec     float64    `json:"etaSec"`
+	BabystepMM float64    `json:"babystepMm"`     // running total since last M500
+	Note       string     `json:"note,omitempty"` // e.g. link lost while an SD print may still run
 }
 
 // Snapshot is the full point-in-time state returned by the JSON API.
 type Snapshot struct {
-	State      State    `json:"state"`
-	Connected  bool     `json:"connected"`
-	Temps      Temps    `json:"temps"`
-	Job        *Job     `json:"job,omitempty"`
+	State        State    `json:"state"`
+	Connected    bool     `json:"connected"`
+	Temps        Temps    `json:"temps"`
+	Job          *Job     `json:"job,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
-	LastError  string   `json:"lastError,omitempty"`
+	LastError    string   `json:"lastError,omitempty"`
 }

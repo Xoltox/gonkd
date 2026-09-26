@@ -5,33 +5,37 @@ import (
 	"strings"
 )
 
-// ParseTemps parses a Marlin temperature report line, either from an M105
-// reply or an AUTO_REPORT_TEMPERATURES (M155 S<n>) push, e.g.:
-//
-//	"T:210.12 /210.00 B:60.03 /60.00 @:127 B@:80"
-//
-// It returns ok=false if the line has no recognizable T: field.
-// ParseTemps handles Marlin's space-separated actual/target format, e.g.
-// "T:210.12 /210.00 B:60.03 /60.00 @:127 B@:80", where the "/target" for a
-// given sensor is a separate whitespace-delimited token immediately
-// following its "X:actual" token (not glued to it).
+// ParseTemps parses a Marlin temperature report, either an M105 reply
+// ("ok T:210.12 /210.00 B:60.03 /60.00 @:127 B@:80") or an
+// AUTO_REPORT_TEMPERATURES (M155 S<n>) push (" T:210.12 /210.00 B:..."),
+// where the "/target" for a sensor is a separate whitespace-delimited token
+// right after its "X:actual" token. Only lines that start with "T:" or
+// "ok T:" are accepted, so a file name or echo that happens to contain
+// "T:" cannot clobber the readings. (ADVANCED_OK never adds N/P/B to the
+// M105 reply: M105 prints its own "ok" and skips ok_to_send.)
 func ParseTemps(line string) (Temps, bool) {
 	var t Temps
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "T:") && !strings.HasPrefix(trimmed, "ok T:") {
+		return t, false
+	}
 	found := false
-	fields := strings.Fields(line)
+	fields := strings.Fields(trimmed)
 	for i, f := range fields {
-		var actual *float64
-		var target *float64
+		var actual, target *float64
 		switch {
 		case strings.HasPrefix(f, "T:"):
 			actual, target = &t.HotendActual, &t.HotendTarget
-			*actual, _ = strconv.ParseFloat(f[2:], 64)
 		case strings.HasPrefix(f, "B:"):
 			actual, target = &t.BedActual, &t.BedTarget
-			*actual, _ = strconv.ParseFloat(f[2:], 64)
 		default:
 			continue
 		}
+		v, err := strconv.ParseFloat(f[2:], 64)
+		if err != nil {
+			continue
+		}
+		*actual = v
 		found = true
 		if i+1 < len(fields) && strings.HasPrefix(fields[i+1], "/") {
 			*target, _ = strconv.ParseFloat(fields[i+1][1:], 64)
@@ -73,39 +77,70 @@ func ParseSDStatus(line string) (SDStatus, bool) {
 }
 
 // ParseFileListLine parses one line of an M20 L (long filename) listing.
-// Marlin's LONG_FILENAME_HOST_SUPPORT format is:
+// This firmware (Marlin 2.1.2.7 cardreader.cpp printListing) prints the
+// long name unquoted, and for files without a long name repeats the short
+// name:
 //
 //	Begin file list
-//	shortname.gco 12345 "Long File Name.gcode"
+//	BENCHY~1.GCO 123456 Benchy Test.gcode
+//	CUBE.GCO 2048 CUBE.GCO
+//	SUBDIR/PART.GCO 99 Sub Dir/part.gcode
 //	End file list
 //
-// (quoting of the long name and exact spacing has varied across Marlin
-// versions; this accepts the common form and degrades gracefully.)
+// Subdirectory entries (anything containing "/") are skipped: forge only
+// prints and uploads in the card root. Only 8.3-shaped short names are
+// accepted, so an autoreport or "ok" line interleaved with a long listing
+// is never mistaken for a file.
 func ParseFileListLine(line string) (SDFile, bool) {
-	trimmed := strings.TrimSpace(line)
-	if trimmed == "" || trimmed == "Begin file list" || trimmed == "End file list" {
+	fields := strings.Fields(line)
+	if len(fields) < 2 || strings.Contains(line, "/") {
 		return SDFile{}, false
 	}
-	fields := strings.Fields(trimmed)
-	if len(fields) == 0 {
+	if !valid83(fields[0]) {
 		return SDFile{}, false
 	}
-	f := SDFile{Short: strings.ToUpper(fields[0])}
-	if len(fields) >= 2 {
-		if n, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
-			f.Bytes = n
-		}
+	size, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil || size < 0 {
+		return SDFile{}, false
 	}
-	if qi := strings.Index(trimmed, "\""); qi >= 0 {
-		if qj := strings.LastIndex(trimmed, "\""); qj > qi {
-			f.Long = trimmed[qi+1 : qj]
-		}
+	f := SDFile{Short: strings.ToUpper(fields[0]), Bytes: size}
+	if len(fields) > 2 {
+		f.Long = strings.Join(fields[2:], " ")
 	}
 	return f, true
 }
 
-// Capabilities parses M115 EXTENDED_CAPABILITIES_REPORT lines of the form
-// "Cap:AUTOREPORT_TEMP:1".
+// valid83 reports whether s looks like an 8.3 short name:
+// [A-Z0-9_~]{1,8} optionally followed by "." and [A-Z0-9_]{1,3}
+// (case-insensitive).
+func valid83(s string) bool {
+	base, ext := s, ""
+	hasDot := false
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		base, ext, hasDot = s[:i], s[i+1:], true
+	}
+	if len(base) < 1 || len(base) > 8 || (hasDot && (len(ext) < 1 || len(ext) > 3)) {
+		return false
+	}
+	for i := 0; i < len(base); i++ {
+		if !is83Char(base[i]) {
+			return false
+		}
+	}
+	for i := 0; i < len(ext); i++ {
+		if ext[i] == '~' || !is83Char(ext[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func is83Char(c byte) bool {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '~'
+}
+
+// ParseCapability parses M115 EXTENDED_CAPABILITIES_REPORT lines of the
+// form "Cap:AUTOREPORT_TEMP:1".
 func ParseCapability(line string) (name string, enabled bool, ok bool) {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "Cap:") {

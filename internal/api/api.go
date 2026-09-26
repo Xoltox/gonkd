@@ -6,10 +6,14 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,16 +26,52 @@ const forgeVersion = "0.1.0"
 
 // Server wires the Manager to HTTP handlers.
 type Server struct {
-	Mgr     *printer.Manager
-	DataDir string // for staging uploads before transfer
-	MaxBody int64  // upload size cap in bytes
-	Mode    printer.UploadMode // default upload mode (sd or stream)
+	Mgr        *printer.Manager
+	DataDir    string             // for staging uploads before transfer
+	MaxBody    int64              // upload size cap in bytes; <= 0 means no cap
+	Mode       printer.UploadMode // default upload mode (sd or stream)
+	AllowHosts []string           // extra Host header values allowed besides IP literals and localhost
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("forge: write response: %v", err)
+	}
+}
+
+// noContent writes a bare 204: no body, so net/http never has to reconcile
+// a Content-Length with an encoded "null".
+func noContent(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeErr maps a Manager/Driver error to an HTTP status and writes a short,
+// human-readable body (OrcaSlicer surfaces this text in its error dialog).
+func writeErr(w http.ResponseWriter, err error) {
+	code := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, printer.ErrDisconnected):
+		code = http.StatusConflict
+	case errors.Is(err, printer.ErrJobActive):
+		code = http.StatusConflict
+	case errors.Is(err, printer.ErrBusy):
+		code = http.StatusConflict
+	case errors.Is(err, printer.ErrNoJob):
+		code = http.StatusConflict
+	case errors.Is(err, printer.ErrNotPrinting):
+		code = http.StatusConflict
+	case errors.Is(err, printer.ErrClosed):
+		code = http.StatusConflict
+	case errors.Is(err, printer.ErrInvalidCommand), errors.Is(err, printer.ErrInvalidMode):
+		code = http.StatusBadRequest
+	case errors.Is(err, printer.ErrTimeout):
+		code = http.StatusServiceUnavailable
+	}
+	http.Error(w, err.Error(), code)
 }
 
 // Routes registers every handler on mux.
@@ -56,6 +96,78 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/forge/job/print", s.handleJobPrint)
 	mux.HandleFunc("/forge/emergency", s.handleEmergency)
 	mux.HandleFunc("/forge/babystep", s.handleBabystep)
+	mux.HandleFunc("/forge/jog", s.handleJog)
+}
+
+// --- CSRF / Host hardening (SEC-5, SEC-25) ---
+//
+// Every mutating route runs through checkMutation: POST only, and if an
+// Origin header (or Sec-Fetch-Site: cross-site) is present it must name the
+// same host this request arrived on. The Host header itself must be an IP
+// literal, "localhost", or one of Server.AllowHosts -- this is what lets
+// OrcaSlicer (which addresses forge by IP and sends no Origin at all) through
+// while blocking a browser tab on some unrelated DNS name from driving forge
+// via a cross-site fetch/form.
+func (s *Server) checkMutation(w http.ResponseWriter, r *http.Request, requireJSON bool) bool {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed, POST required", http.StatusMethodNotAllowed)
+		return false
+	}
+	if !isAllowedHost(r.Host, s.AllowHosts) {
+		http.Error(w, "host not allowed", http.StatusMisdirectedRequest)
+		return false
+	}
+	if sfs := r.Header.Get("Sec-Fetch-Site"); sfs == "cross-site" {
+		http.Error(w, "cross-site request rejected", http.StatusForbidden)
+		return false
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		return false
+	}
+	if requireJSON {
+		ct := r.Header.Get("Content-Type")
+		if !strings.HasPrefix(ct, "application/json") {
+			http.Error(w, "expected application/json", http.StatusUnsupportedMediaType)
+			return false
+		}
+	}
+	return true
+}
+
+func stripHostPort(hostport string) string {
+	h, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		h = hostport
+	}
+	h = strings.TrimPrefix(h, "[")
+	h = strings.TrimSuffix(h, "]")
+	return h
+}
+
+func isAllowedHost(host string, allow []string) bool {
+	h := stripHostPort(host)
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	for _, a := range allow {
+		if strings.EqualFold(stripHostPort(a), h) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameOrigin(origin, host string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(stripHostPort(u.Host), stripHostPort(host))
 }
 
 // --- OctoPrint subset ---
@@ -79,53 +191,68 @@ func (s *Server) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAPIServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
-		"version": forgeVersion,
+		"version":  forgeVersion,
 		"safemode": nil,
 	})
 }
 
 func (s *Server) handleConnection(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		// OrcaSlicer may POST to (re)connect; forge is always connected
-		// once the service is up, so just acknowledge.
-		writeJSON(w, 204, nil)
+	if r.Method == http.MethodGet {
+		snap := s.Mgr.Snapshot()
+		state := "Closed"
+		if snap.Connected {
+			state = "Operational"
+			switch snap.State {
+			case printer.StatePrinting, printer.StateUploading:
+				state = "Printing"
+			case printer.StatePaused:
+				state = "Paused"
+			case printer.StateError:
+				state = "Closed"
+			}
+		}
+		writeJSON(w, 200, map[string]interface{}{
+			"current": map[string]interface{}{
+				"state":          state,
+				"port":           "/dev/ttyUSB0",
+				"baudrate":       250000,
+				"printerProfile": "default",
+			},
+			"options": map[string]interface{}{
+				"ports":     []string{"/dev/ttyUSB0"},
+				"baudrates": []int{250000},
+			},
+		})
 		return
 	}
-	state := "Operational"
-	switch s.Mgr.State() {
-	case printer.StatePrinting:
-		state = "Printing"
-	case printer.StatePaused:
-		state = "Paused"
-	case printer.StateError, printer.StateDisconnected:
-		state = "Closed"
+	// OrcaSlicer may POST to (re)connect; forge manages its own serial link,
+	// so just acknowledge.
+	if !s.checkMutation(w, r, false) {
+		return
 	}
-	writeJSON(w, 200, map[string]interface{}{
-		"current": map[string]interface{}{
-			"state":       state,
-			"port":        "/dev/ttyUSB0",
-			"baudrate":    250000,
-			"printerProfile": "default",
-		},
-		"options": map[string]interface{}{
-			"ports":     []string{"/dev/ttyUSB0"},
-			"baudrates": []int{250000},
-		},
-	})
+	noContent(w)
 }
 
 func (s *Server) handlePrinterState(w http.ResponseWriter, r *http.Request) {
-	temps := s.Mgr.Driver.Temps()
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	snap := s.Mgr.Snapshot()
+	if !snap.Connected {
+		http.Error(w, "printer not connected", http.StatusConflict)
+		return
+	}
 	flags := map[string]bool{
-		"operational": true,
-		"paused":      snap.State == printer.StatePaused,
-		"printing":    snap.State == printer.StatePrinting,
-		"cancelling":  snap.State == printer.StateCancelling,
-		"pausing":     false,
-		"error":       snap.State == printer.StateError,
-		"ready":       snap.State == printer.StateIdle,
-		"closedOrError": snap.State == printer.StateDisconnected,
+		"operational":   true,
+		"paused":        snap.State == printer.StatePaused,
+		"printing":      snap.State == printer.StatePrinting,
+		"cancelling":    snap.State == printer.StateCancelling,
+		"pausing":       false,
+		"error":         snap.State == printer.StateError,
+		"ready":         snap.State == printer.StateIdle,
+		"closedOrError": false,
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"state": map[string]interface{}{
@@ -133,8 +260,8 @@ func (s *Server) handlePrinterState(w http.ResponseWriter, r *http.Request) {
 			"flags": flags,
 		},
 		"temperature": map[string]interface{}{
-			"tool0": map[string]interface{}{"actual": temps.HotendActual, "target": temps.HotendTarget, "offset": 0},
-			"bed":   map[string]interface{}{"actual": temps.BedActual, "target": temps.BedTarget, "offset": 0},
+			"tool0": map[string]interface{}{"actual": snap.Temps.HotendActual, "target": snap.Temps.HotendTarget, "offset": 0},
+			"bed":   map[string]interface{}{"actual": snap.Temps.BedActual, "target": snap.Temps.BedTarget, "offset": 0},
 		},
 	})
 }
@@ -143,11 +270,15 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		snap := s.Mgr.Snapshot()
+		if !snap.Connected {
+			http.Error(w, "printer not connected", http.StatusConflict)
+			return
+		}
 		resp := map[string]interface{}{
 			"job": map[string]interface{}{"file": map[string]interface{}{}},
 			"progress": map[string]interface{}{
-				"completion":  0.0,
-				"printTime":   0,
+				"completion":    0.0,
+				"printTime":     0,
 				"printTimeLeft": 0,
 			},
 			"state": string(snap.State),
@@ -164,58 +295,65 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, resp)
 	case http.MethodPost:
+		if !s.checkMutation(w, r, true) {
+			return
+		}
 		var body struct {
 			Command string `json:"command"`
+			Action  string `json:"action"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		var err error
 		switch body.Command {
 		case "cancel":
-			s.cancelActive()
+			err = s.Mgr.Cancel()
 		case "pause":
-			s.pauseActive()
+			switch body.Action {
+			case "resume":
+				err = s.Mgr.Resume()
+			default:
+				err = s.Mgr.Pause()
+			}
 		case "start":
 			// no-op: OrcaSlicer starts via the upload's print=true instead
 		}
-		writeJSON(w, 204, nil)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		noContent(w)
 	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) pauseActive() {
-	if s.Mgr.State() == printer.StatePaused {
-		if s.Mode == printer.ModeStream {
-			s.Mgr.ResumeStream()
-		} else {
-			s.Mgr.ResumeSD()
-		}
-		return
-	}
-	if s.Mode == printer.ModeStream {
-		s.Mgr.PauseStream()
-	} else {
-		s.Mgr.PauseSD()
-	}
-}
-
-func (s *Server) cancelActive() {
-	if s.Mode == printer.ModeStream {
-		s.Mgr.CancelStream()
-	} else {
-		s.Mgr.CancelSD()
-	}
-}
-
-// handleFilesLocal implements POST /api/files/local, the endpoint
+// handleFilesLocal implements GET/POST /api/files/local, the endpoint
 // OrcaSlicer's OctoPrint uploader hits with a multipart "file" field plus
 // optional "print"/"select" fields.
 func (s *Server) handleFilesLocal(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		writeJSON(w, 200, map[string]interface{}{"files": []interface{}{}})
+		files := s.Mgr.SDFiles()
+		out := make([]map[string]interface{}, 0, len(files))
+		for _, f := range files {
+			name := f.Long
+			if name == "" {
+				name = f.Short
+			}
+			out = append(out, map[string]interface{}{
+				"name":   name,
+				"origin": "local",
+				"size":   f.Bytes,
+				"type":   "machinecode",
+			})
+		}
+		writeJSON(w, 200, map[string]interface{}{"files": out})
 		return
 	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !s.checkMutation(w, r, false) {
 		return
 	}
 	s.handleUploadCommon(w, r, r.URL.Query().Get("mode"))
@@ -228,60 +366,121 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !s.checkMutation(w, r, true) {
 		return
 	}
-	var body struct{ Cmd string `json:"cmd"` }
+	var body struct {
+		Cmd string `json:"cmd"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Cmd == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	s.Mgr.Driver.Send(body.Cmd)
-	writeJSON(w, 204, nil)
+	if err := s.Mgr.Send(body.Cmd); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
 }
 
 func (s *Server) handleConsole(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]interface{}{"lines": s.Mgr.Driver.Console()})
+	writeJSON(w, 200, map[string]interface{}{"lines": s.Mgr.Console()})
 }
 
 func (s *Server) handleSDFiles(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("refresh") == "1" {
-		s.Mgr.Driver.Send("M20 L")
+		if err := s.Mgr.RefreshFiles(); err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
-	writeJSON(w, 200, map[string]interface{}{"files": s.Mgr.Driver.SDFiles()})
+	writeJSON(w, 200, map[string]interface{}{"files": s.Mgr.SDFiles()})
 }
 
 func (s *Server) handleSDDelete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !s.checkMutation(w, r, true) {
 		return
 	}
-	var body struct{ Name string `json:"name"` }
+	var body struct {
+		Name string `json:"name"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	s.Mgr.Driver.Send(fmt.Sprintf("M30 %s", strings.ToUpper(body.Name)))
-	s.Mgr.Names.Forget(strings.ToUpper(body.Name))
-	_ = s.Mgr.Names.Save()
-	writeJSON(w, 204, nil)
+	if err := s.Mgr.DeleteFile(strings.ToUpper(body.Name)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
 }
 
-func (s *Server) handleJobPause(w http.ResponseWriter, r *http.Request)  { s.pauseActive(); writeJSON(w, 204, nil) }
-func (s *Server) handleJobResume(w http.ResponseWriter, r *http.Request) { s.pauseActive(); writeJSON(w, 204, nil) }
-func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request) { s.cancelActive(); writeJSON(w, 204, nil) }
+func (s *Server) handleJobPause(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, false) {
+		return
+	}
+	if err := s.Mgr.Pause(); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+func (s *Server) handleJobResume(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, false) {
+		return
+	}
+	if err := s.Mgr.Resume(); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, false) {
+		return
+	}
+	if err := s.Mgr.Cancel(); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
 
 func (s *Server) handleJobPrint(w http.ResponseWriter, r *http.Request) {
-	s.handleUploadCommon(w, r, string(s.Mode))
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.Mgr.StartSDPrint(strings.ToUpper(body.Name)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
 }
 
 func (s *Server) handleEmergency(w http.ResponseWriter, r *http.Request) {
-	s.Mgr.EmergencyStop()
-	writeJSON(w, 204, nil)
+	if !s.checkMutation(w, r, false) {
+		return
+	}
+	if err := s.Mgr.Emergency(); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
 }
 
 func (s *Server) handleBabystep(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
 	var body struct {
 		DeltaMM float64 `json:"deltaMm"`
 		Save    bool    `json:"save"`
@@ -291,35 +490,107 @@ func (s *Server) handleBabystep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.DeltaMM != 0 {
-		// M290 Z<mm>: Marlin interprets this in mm directly.
-		s.Mgr.Driver.Send(fmt.Sprintf("M290 Z%.3f", body.DeltaMM))
+		if err := s.Mgr.Babystep(body.DeltaMM); err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
 	if body.Save {
-		s.Mgr.Driver.Send("M500")
+		if err := s.Mgr.SaveSettings(); err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
-	writeJSON(w, 204, nil)
+	noContent(w)
 }
 
-// handleUploadCommon does the multipart parse + staging-to-DataDir +
-// Manager dispatch shared by both the OctoPrint endpoint and forge's own.
-func (s *Server) handleUploadCommon(w http.ResponseWriter, r *http.Request, modeParam string) {
-	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		// Fall back to a larger in-memory threshold only if needed; actual
-		// file bytes still stream to disk via the standard library.
-	}
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "missing file field", http.StatusBadRequest)
+// handleJog implements POST /forge/jog: a single validated, ordered
+// G91/G1/G90 sequence, replacing the UI's old three independent requests
+// (SEC-8) whose ordering across separate HTTP connections was never
+// guaranteed.
+func (s *Server) handleJog(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
 		return
 	}
-	defer file.Close()
+	var body struct {
+		Axis string  `json:"axis"`
+		Dist float64 `json:"dist"`
+		Feed float64 `json:"feed"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	// R-05: a move must not land while a job owns the port or the head
+	// mid-print; babystep/pause/resume/cancel/E-stop go through other
+	// routes and are unaffected.
+	switch s.Mgr.Snapshot().State {
+	case printer.StateUploading, printer.StatePrinting, printer.StatePaused:
+		http.Error(w, "move disabled while a job is active", http.StatusConflict)
+		return
+	}
+	axis := strings.ToUpper(strings.TrimSpace(body.Axis))
+	if axis != "X" && axis != "Y" && axis != "Z" && axis != "E" {
+		http.Error(w, "axis must be one of X, Y, Z, E", http.StatusBadRequest)
+		return
+	}
+	limit := 100.0
+	if axis == "E" {
+		limit = 50.0
+	}
+	dist := clamp(body.Dist, -limit, limit)
+	feed := body.Feed
+	if feed <= 0 {
+		feed = 3000
+		if axis == "E" {
+			feed = 300
+		}
+	}
+	feed = clamp(feed, 1, 10000)
 
-	if s.MaxBody > 0 && header.Size > s.MaxBody {
-		http.Error(w, fmt.Sprintf("file too large: %d bytes (cap %d)", header.Size, s.MaxBody), http.StatusRequestEntityTooLarge)
+	cmds := []string{"G91", fmt.Sprintf("G1 %s%.4f F%.0f", axis, dist, feed), "G90"}
+	if err := s.Mgr.SendSequence(cmds); err != nil {
+		writeErr(w, err)
 		return
 	}
-	if free, err := freeSpace(s.DataDir); err == nil && header.Size > free {
-		http.Error(w, "insufficient space in data dir", http.StatusInsufficientStorage)
+	noContent(w)
+}
+
+func clamp(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// handleUploadCommon streams the multipart "file" part straight into a
+// staging file under DataDir (SEC-4, SEC-26), enforcing MaxBody as it goes,
+// then hands the staged path to Manager.Upload. Upload is async: it returns
+// once the request is validated (connected, no active job) and the transfer
+// itself runs in the background, so the HTTP request completes quickly and
+// failures during the actual transfer surface via /forge/status.lastError
+// (G5).
+func (s *Server) handleUploadCommon(w http.ResponseWriter, r *http.Request, modeParam string) {
+	mode := printer.UploadMode(modeParam)
+	if mode == "" {
+		mode = s.Mode
+	}
+	if mode != printer.ModeSDUpload && mode != printer.ModeStream {
+		http.Error(w, fmt.Sprintf("unknown upload mode %q", modeParam), http.StatusBadRequest)
+		return
+	}
+
+	capBytes := s.MaxBody // <= 0 means "no cap", handled consistently below
+	if capBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, capBytes+64*1024)
+	}
+
+	mr, err := r.MultipartReader()
+	if err != nil {
+		http.Error(w, "expected multipart/form-data", http.StatusBadRequest)
 		return
 	}
 
@@ -327,55 +598,180 @@ func (s *Server) handleUploadCommon(w http.ResponseWriter, r *http.Request, mode
 		http.Error(w, "server storage error", http.StatusInternalServerError)
 		return
 	}
-	longName := header.Filename
-	stagePath := filepath.Join(s.DataDir, fmt.Sprintf("upload-%d-%s", time.Now().UnixNano(), sanitizeStageName(longName)))
-	out, err := os.Create(stagePath)
-	if err != nil {
-		http.Error(w, "server storage error", http.StatusInternalServerError)
-		return
+	// R-06: the old check demanded the *whole* MaxBody free, regardless of
+	// how big this upload actually is, so a small upload could be rejected
+	// on a mostly-full tmpfs. Use the real request size when we have one
+	// (Content-Length; Orca sends it, and it already includes the small
+	// multipart overhead, so it is a safe overestimate of the file size),
+	// capped at MaxBody since that is all this upload can ever write. When
+	// the size isn't known up front, fall back to a small startup margin and
+	// keep checking free space as bytes actually land on disk (spaceGuard).
+	const spaceMargin int64 = 2 << 20 // 2 MiB headroom kept free
+	needed := spaceMargin
+	if r.ContentLength > 0 {
+		want := r.ContentLength
+		if capBytes > 0 && want > capBytes {
+			want = capBytes
+		}
+		needed = want + spaceMargin
 	}
-	written, err := io.Copy(out, io.LimitReader(file, s.MaxBody+1))
-	out.Close()
-	if err != nil {
-		os.Remove(stagePath)
-		http.Error(w, "upload read error", http.StatusInternalServerError)
-		return
-	}
-	if s.MaxBody > 0 && written > s.MaxBody {
-		os.Remove(stagePath)
-		http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
+	if free, err := freeSpace(s.DataDir); err != nil || free < needed {
+		http.Error(w, "insufficient space in data dir", http.StatusInsufficientStorage)
 		return
 	}
 
-	print := r.FormValue("print") == "true" || r.FormValue("print") == "1"
-	mode := printer.UploadMode(modeParam)
-	if mode == "" {
-		mode = s.Mode
-	}
-
-	var short string
-	if mode == printer.ModeStream {
-		if err := s.Mgr.StreamPrint(stagePath, longName); err != nil {
+	var (
+		stagePath string
+		longName  string
+		written   int64
+		gotFile   bool
+		print     bool
+	)
+	cleanup := func() {
+		if stagePath != "" {
 			os.Remove(stagePath)
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
-		}
-	} else {
-		short, err = s.Mgr.UploadAndMaybePrint(stagePath, longName, print)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
 		}
 	}
 
-	log.Printf("forge: uploaded %q (%d bytes) as %q mode=%s print=%v", longName, written, short, mode, print)
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			cleanup()
+			// http.MaxBytesReader surfaces overflow here as a body-read error.
+			http.Error(w, "upload read error", http.StatusRequestEntityTooLarge)
+			return
+		}
+		name := part.FormName()
+		switch {
+		case name == "file" && part.FileName() != "":
+			if gotFile {
+				part.Close()
+				continue // ignore extra file parts
+			}
+			gotFile = true
+			longName = part.FileName()
+			stagePath = filepath.Join(s.DataDir, fmt.Sprintf("upload-%d-%s", time.Now().UnixNano(), sanitizeStageName(longName)))
+			out, err := os.Create(stagePath)
+			if err != nil {
+				part.Close()
+				http.Error(w, "server storage error", http.StatusInternalServerError)
+				return
+			}
+			// When the request had no usable Content-Length, the up-front
+			// check above only guarantees a small margin; keep checking
+			// actual free space against the running byte count as the file
+			// streams in, so a large upload on a nearly-full tmpfs fails
+			// fast instead of filling it (R-06).
+			src := io.Reader(part)
+			if r.ContentLength <= 0 {
+				src = &spaceCheckReader{r: part, dir: s.DataDir, margin: spaceMargin, every: 4 << 20}
+			}
+			written, err = copyLimited(out, src, capBytes)
+			out.Close()
+			part.Close()
+			if err != nil {
+				cleanup()
+				switch err {
+				case errTooLarge:
+					http.Error(w, fmt.Sprintf("file too large (cap %d bytes)", capBytes), http.StatusRequestEntityTooLarge)
+				case errInsufficientSpace:
+					http.Error(w, "insufficient space in data dir", http.StatusInsufficientStorage)
+				default:
+					http.Error(w, "upload read error", http.StatusInternalServerError)
+				}
+				return
+			}
+		case name == "print":
+			v, _ := readSmallField(part)
+			print = v == "true" || v == "1"
+			part.Close()
+		default:
+			// "path", "select", "plateindex", anything else: drain and ignore.
+			io.Copy(io.Discard, part)
+			part.Close()
+		}
+	}
+
+	if !gotFile {
+		cleanup()
+		http.Error(w, "missing file field", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.Mgr.Upload(stagePath, longName, mode, print); err != nil {
+		cleanup()
+		writeErr(w, err)
+		return
+	}
+
+	log.Printf("forge: upload staged %q (%d bytes) mode=%s print=%v", longName, written, mode, print)
 	writeJSON(w, 201, map[string]interface{}{
 		"done": true,
 		"files": map[string]interface{}{
-			"local": map[string]interface{}{"name": short, "origin": "local"},
+			"local": map[string]interface{}{"name": longName, "origin": "local"},
 		},
 	})
 }
+
+var errTooLarge = errors.New("upload exceeds cap")
+var errInsufficientSpace = errors.New("insufficient space in data dir")
+
+// spaceCheckReader re-checks free disk space every `every` bytes read,
+// failing closed (a statfs error counts as "unknown, reject") rather than
+// only trusting a single check made before the transfer started (R-06).
+type spaceCheckReader struct {
+	r         io.Reader
+	dir       string
+	margin    int64
+	every     int64
+	read      int64
+	lastCheck int64
+}
+
+func (s *spaceCheckReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 {
+		s.read += int64(n)
+		if s.read-s.lastCheck >= s.every {
+			s.lastCheck = s.read
+			free, ferr := freeSpace(s.dir)
+			if ferr != nil || free < s.margin {
+				return n, errInsufficientSpace
+			}
+		}
+	}
+	return n, err
+}
+
+// copyLimited copies src into dst, enforcing cap bytes when cap > 0 (cap <=
+// 0 means no cap, consistent with Server.MaxBody). Returns errTooLarge on
+// overflow without leaving the caller guessing from a generic io error.
+func copyLimited(dst io.Writer, src io.Reader, cap int64) (int64, error) {
+	if cap <= 0 {
+		return io.Copy(dst, src)
+	}
+	n, err := io.Copy(dst, io.LimitReader(src, cap+1))
+	if err != nil {
+		return n, err
+	}
+	if n > cap {
+		return n, errTooLarge
+	}
+	return n, nil
+}
+
+func readSmallField(p *multipart.Part) (string, error) {
+	b, err := io.ReadAll(io.LimitReader(p, 4096))
+	return strings.TrimSpace(string(b)), err
+}
+
+// stageNameMax caps the sanitized name so "upload-<nanos>-<name>" stays well
+// under common filesystem NAME_MAX (255 bytes), even for multi-byte UTF-8
+// names (R-20).
+const stageNameMax = 120
 
 func sanitizeStageName(name string) string {
 	name = filepath.Base(name)
@@ -383,6 +779,9 @@ func sanitizeStageName(name string) string {
 	for _, r := range name {
 		if r == '/' || r == '\\' || r == 0 {
 			continue
+		}
+		if b.Len()+len(string(r)) > stageNameMax {
+			break
 		}
 		b.WriteRune(r)
 	}
