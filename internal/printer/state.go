@@ -3,8 +3,9 @@ package printer
 import "time"
 
 // Version is gonkd's own version string, reported in Snapshot and in the
-// OctoPrint-compatible /api/version text.
-const Version = "0.1.0"
+// OctoPrint-compatible /api/version text. Release builds set it from the git
+// tag with -ldflags "-X github.com/Xoltox/gonkd/internal/printer.Version=...".
+var Version = "0.1.0"
 
 // hotendMaxC and bedMaxC are the heat limits enforced by handleHeat/handleTune
 // and reported in Snapshot.Limits so the UI can validate before it even

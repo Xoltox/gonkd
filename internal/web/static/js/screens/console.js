@@ -84,7 +84,7 @@ export function mount(root) {
     const kind = l.dir === 'out' ? 'out' : isError(t) ? 'err' : isResend(t) ? 'resend' : 'in';
     const pre = { out: '>', err: '!', resend: 'R', in: '<' }[kind];
     const row = h('div', { class: `line line-${kind}`, title: 'Click to copy' },
-      h('span', { class: 'ts', text: l.ts ? hms(l.ts) : '--:--:--' }),
+      h('span', { class: 'ts', text: l.ts ? hms(l.ts) : '' }),
       h('span', { class: 'pre', 'aria-hidden': 'true', text: pre }),
       h('span', { class: 'txt', text: t }));
     row.addEventListener('click', () => {

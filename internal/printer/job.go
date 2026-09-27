@@ -1018,7 +1018,9 @@ func formatMM(v float64) string {
 	return s
 }
 
-// SaveSettings stores Marlin's settings (including babystep Z) with M500.
+// SaveSettings stores Marlin's settings with M500. On this firmware
+// (mesh bed leveling, no probe) M500 does not keep babystep Z; that needs
+// G29 S4 Z<offset> first.
 func (m *Manager) SaveSettings() error {
 	return m.Send("M500")
 }

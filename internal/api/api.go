@@ -24,7 +24,7 @@ import (
 	"github.com/Xoltox/gonkd/internal/printer"
 )
 
-const gonkdVersion = printer.Version
+var gonkdVersion = printer.Version
 
 // Server wires the Manager to HTTP handlers.
 type Server struct {

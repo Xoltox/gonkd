@@ -194,7 +194,13 @@ uci commit uhttpd && /etc/init.d/uhttpd restart
 
 (Or keep LuCI on 80 and run Gonk'd with `-listen ":8080"`.)
 
-**3. Build** (cross-compile for mipsle, softfloat because there is no FPU):
+**3. Get the binary.** Easiest: download `gonkd.mipsle` and `gonkd.init`
+from the [latest release](https://github.com/Xoltox/gonkd/releases/latest)
+(check them against `SHA256SUMS`), then skip to step 4 using
+`gonkd.init` in place of `files/gonkd.init`.
+
+Or build it yourself (cross-compile for mipsle, softfloat because there is
+no FPU):
 
 ```sh
 git clone https://github.com/Xoltox/gonkd.git && cd gonkd
@@ -368,5 +374,5 @@ Creality, OctoPrint, Marlin, OrcaSlicer, Lucasfilm or Disney.
 The Marlin configuration files in [`firmware/`](firmware/) are GPL-3.0, see
 [`firmware/LICENSE.md`](firmware/LICENSE.md).
 
-The web UI bundles the Geo, Roboto and Share Tech Mono fonts under the SIL
+The web UI bundles the Geo and Roboto fonts under the SIL
 Open Font License 1.1, see [`internal/web/static/fonts/`](internal/web/static/fonts/).

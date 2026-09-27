@@ -57,7 +57,7 @@ function stripTemp(kind) {
     set(a, t) {
       const st = tempState(a, t);
       setText(val, t1(a));
-      setText(tgt, '/' + (t > 0 ? t0(t) : 'off'));
+      setText(tgt, '/' + (t > 0 ? t0(t) + DEG : 'off'));
       dot.hidden = st !== 'at temp';
       el.setAttribute('aria-label', `${name} ${t1(a)}${DEG}, target ${t > 0 ? t0(t) + DEG : 'off'}, ${st}`);
     },
