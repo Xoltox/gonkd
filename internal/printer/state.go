@@ -2,6 +2,19 @@ package printer
 
 import "time"
 
+// Version is gonkd's own version string, reported in Snapshot and in the
+// OctoPrint-compatible /api/version text.
+const Version = "0.1.0"
+
+// hotendMaxC and bedMaxC are the heat limits enforced by handleHeat/handleTune
+// and reported in Snapshot.Limits so the UI can validate before it even
+// sends a request. They are fixed rather than read from the printer: this
+// firmware build does not report its own thermal limits over serial.
+const (
+	hotendMaxC = 260.0
+	bedMaxC    = 110.0
+)
+
 // State is the coarse job state exposed to the HTTP API and UI.
 type State string
 
@@ -27,20 +40,21 @@ const (
 // Temps holds the latest actual/target readings, as reported by
 // AUTO_REPORT_TEMPERATURES (M155) or an M105 poll.
 type Temps struct {
-	HotendActual float64
-	HotendTarget float64
-	BedActual    float64
-	BedTarget    float64
-	FanPercent   int
-	UpdatedAt    time.Time
+	HotendActual float64   `json:"hotendActual"`
+	HotendTarget float64   `json:"hotendTarget"`
+	BedActual    float64   `json:"bedActual"`
+	BedTarget    float64   `json:"bedTarget"`
+	FanPercent   int       `json:"fanPercent"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
 // SDFile is one entry from an M20 L (long-name) listing, cross-referenced
 // against the local NameMap so the UI can show the original long name.
 type SDFile struct {
-	Short string `json:"short"`
-	Long  string `json:"long"`
-	Bytes int64  `json:"bytes"`
+	Short string  `json:"short"`
+	Long  string  `json:"long"`
+	Bytes int64   `json:"bytes"`
+	Meta  *SDMeta `json:"meta,omitempty"` // parsed from slicer comments during upload
 }
 
 // Job describes the currently active (or most recently finished) print.
@@ -57,12 +71,31 @@ type Job struct {
 	Note       string     `json:"note,omitempty"` // e.g. link lost while an SD print may still run
 }
 
+// Tune holds the live speed/flow/fan overrides gonkd last sent, defaulting
+// to 100/100/0 (Marlin's own defaults) whenever a printer connects.
+type Tune struct {
+	Speed int `json:"speed"`
+	Flow  int `json:"flow"`
+	Fan   int `json:"fan"`
+}
+
+// Limits are the heat targets handleHeat/handleTune accept, echoed in
+// Snapshot so the UI never has to hardcode them.
+type Limits struct {
+	HotendMax float64 `json:"hotendMax"`
+	BedMax    float64 `json:"bedMax"`
+}
+
 // Snapshot is the full point-in-time state returned by the JSON API.
 type Snapshot struct {
+	Version      string   `json:"version"`
 	State        State    `json:"state"`
 	Connected    bool     `json:"connected"`
 	Temps        Temps    `json:"temps"`
 	Job          *Job     `json:"job,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
 	LastError    string   `json:"lastError,omitempty"`
+	Firmware     string   `json:"firmware,omitempty"`
+	Tune         Tune     `json:"tune"`
+	Limits       Limits   `json:"limits"`
 }

@@ -367,3 +367,6 @@ Creality, OctoPrint, Marlin, OrcaSlicer, Lucasfilm or Disney.
 
 The Marlin configuration files in [`firmware/`](firmware/) are GPL-3.0, see
 [`firmware/LICENSE.md`](firmware/LICENSE.md).
+
+The web UI bundles the Geo, Roboto and Share Tech Mono fonts under the SIL
+Open Font License 1.1, see [`internal/web/static/fonts/`](internal/web/static/fonts/).

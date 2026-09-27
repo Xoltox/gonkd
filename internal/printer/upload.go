@@ -210,6 +210,9 @@ func (d *Driver) uploadASCII(ctx context.Context, gen uint64, localPath, short s
 		line := scanner.Text()
 		lineNo++
 		sent += int64(len(line)) + 1
+		if d.metaFeed != nil {
+			d.metaFeed(line)
+		}
 		cmd := stripComment(line)
 		if cmd == "" || isSaveControl(cmd) || hasM110(cmd) {
 			continue

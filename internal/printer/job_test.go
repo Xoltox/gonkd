@@ -756,3 +756,77 @@ func TestUploadRejectsUnknownMode(t *testing.T) {
 		t.Fatal("staged file not removed")
 	}
 }
+
+// TestTuneSendsExpectedGcode checks the exact G-code Tune generates
+// (M220/M221/M106, fan percent scaled to 0-255) and that Snapshot.Tune
+// reflects the values only after the printer accepted them.
+func TestTuneSendsExpectedGcode(t *testing.T) {
+	mgr, f := jtRig(t, nil)
+	if snap := mgr.Snapshot(); snap.Tune != (Tune{Speed: 100, Flow: 100, Fan: 0}) {
+		t.Fatalf("initial Tune = %+v, want the 100/100/0 default", snap.Tune)
+	}
+
+	speed, flow, fan := 150, 90, 50
+	if err := mgr.Tune(&speed, &flow, &fan); err != nil {
+		t.Fatalf("Tune: %v", err)
+	}
+	jtWait(t, "M106", func() bool { return f.count("M106 S128") == 1 })
+	if f.count("M220 S150") != 1 || f.count("M221 S90") != 1 {
+		t.Fatalf("unexpected commands")
+	}
+	if snap := mgr.Snapshot(); snap.Tune != (Tune{Speed: 150, Flow: 90, Fan: 50}) {
+		t.Fatalf("Tune snapshot = %+v", snap.Tune)
+	}
+
+	// fan=0 must send M107, not "M106 S0".
+	zero := 0
+	if err := mgr.Tune(nil, nil, &zero); err != nil {
+		t.Fatalf("Tune(fan=0): %v", err)
+	}
+	jtWait(t, "M107", func() bool { return f.count("M107") == 1 })
+
+	// A partial call only touches the fields given.
+	speed2 := 200
+	if err := mgr.Tune(&speed2, nil, nil); err != nil {
+		t.Fatalf("Tune(speed only): %v", err)
+	}
+	jtWait(t, "M220 S200", func() bool { return f.count("M220 S200") == 1 })
+	if snap := mgr.Snapshot(); snap.Tune != (Tune{Speed: 200, Flow: 90, Fan: 0}) {
+		t.Fatalf("Tune snapshot after partial call = %+v", snap.Tune)
+	}
+}
+
+// TestHeatSendsExpectedGcode checks Heat's exact M104/M140 output,
+// including the 0 = off case, and that it never sends anything on its own
+// (only in direct response to this call).
+func TestHeatSendsExpectedGcode(t *testing.T) {
+	mgr, f := jtRig(t, nil)
+	hotend, bed := 200.0, 60.0
+	if err := mgr.Heat(&hotend, &bed); err != nil {
+		t.Fatalf("Heat: %v", err)
+	}
+	jtWait(t, "M140", func() bool { return f.count("M140 S60") == 1 })
+	if f.count("M104 S200") != 1 {
+		t.Fatalf("M104 not sent as expected: %v", f.seen)
+	}
+
+	off := 0.0
+	if err := mgr.Heat(&off, &off); err != nil {
+		t.Fatalf("Heat(cooldown): %v", err)
+	}
+	jtWait(t, "M104 S0", func() bool { return f.count("M104 S0") == 1 })
+	if f.count("M140 S0") != 1 {
+		t.Fatalf("M140 S0 not sent: %v", f.seen)
+	}
+
+	// hotend-only leaves the bed command out entirely.
+	before := f.count("M140")
+	temp := 235.5
+	if err := mgr.Heat(&temp, nil); err != nil {
+		t.Fatalf("Heat(hotend only): %v", err)
+	}
+	jtWait(t, "M104 S235.5", func() bool { return f.count("M104 S235.5") == 1 })
+	if f.count("M140") != before {
+		t.Fatalf("bed command sent when only hotend was requested")
+	}
+}

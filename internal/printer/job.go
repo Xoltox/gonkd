@@ -22,6 +22,9 @@ var (
 	ErrNotPrinting  = errors.New("the job is not printing")
 	// ErrInvalidMode is returned (wrapped) by Upload for an unknown mode.
 	ErrInvalidMode = errors.New("unknown upload mode")
+	// ErrUnknownFile is returned by RenameFile for a short name not in the
+	// current SD listing.
+	ErrUnknownFile = errors.New("file not found")
 )
 
 // sdStartGrace is how long an SD job may report "Not SD printing" after
@@ -75,11 +78,27 @@ type Manager struct {
 	sdSeen    bool // M27 reported "SD printing" for the current SD job
 	sdIgnore  bool // a stale "SD printing" may linger; wait for "Not SD printing"
 	reconcile bool // SD job kept across a link loss; waiting for the first M27
+
+	// speed/flow/fan are the last values gonkd itself sent via Tune
+	// (M220/M221/M106/M107), reset to Marlin's own defaults on every
+	// connect (Attach).
+	speed, flow, fan int
+
+	meta    *MetaStore   // optional: slicer metadata/thumbnails for SD files
+	presets *PresetStore // optional: heat presets; Presets() falls back to defaults if nil
 }
 
 func NewManager(names *NameMap) *Manager {
-	return &Manager{Names: names, state: StateDisconnected}
+	return &Manager{Names: names, state: StateDisconnected, speed: 100, flow: 100, fan: 0}
 }
+
+// SetMetaStore wires in per-file slicer metadata storage. Call it once at
+// startup, before the manager is used.
+func (m *Manager) SetMetaStore(ms *MetaStore) { m.meta = ms }
+
+// SetPresetStore wires in heat preset persistence. Call it once at startup,
+// before the manager is used.
+func (m *Manager) SetPresetStore(ps *PresetStore) { m.presets = ps }
 
 // Attach makes d the current driver. The Link calls it after Handshake and
 // before d.Start so no event is missed.
@@ -108,6 +127,7 @@ func (m *Manager) Attach(d *Driver) {
 	defer m.mu.Unlock()
 	m.drv = d
 	m.sdIgnore = false
+	m.speed, m.flow, m.fan = 100, 100, 0
 	switch {
 	case m.job != nil && m.reconcile:
 		// Wait for the first M27 report to say whether it still runs.
@@ -172,6 +192,7 @@ func (m *Manager) Snapshot() Snapshot {
 	drv := m.drv
 	state := m.state
 	lastErr := m.lastErr
+	speed, flow, fan := m.speed, m.flow, m.fan
 	var job *Job
 	if m.job != nil {
 		j := *m.job
@@ -185,9 +206,18 @@ func (m *Manager) Snapshot() Snapshot {
 			job.ETASec = job.ElapsedSec/job.Progress*100 - job.ElapsedSec
 		}
 	}
-	snap := Snapshot{State: state, Connected: drv != nil, Job: job, LastError: lastErr}
+	snap := Snapshot{
+		Version:   Version,
+		State:     state,
+		Connected: drv != nil,
+		Job:       job,
+		LastError: lastErr,
+		Tune:      Tune{Speed: speed, Flow: flow, Fan: fan},
+		Limits:    Limits{HotendMax: hotendMaxC, BedMax: bedMaxC},
+	}
 	if drv != nil {
 		snap.Temps = drv.Temps()
+		snap.Firmware = drv.Firmware()
 		for k, v := range drv.Capabilities() {
 			if v {
 				snap.Capabilities = append(snap.Capabilities, k)
@@ -485,6 +515,11 @@ func (m *Manager) workerExit(done chan struct{}, localPath string) {
 }
 
 func (m *Manager) runSD(ctx context.Context, drv *Driver, job *Job, localPath, longName string, startPrint bool) {
+	var mp *metaParser
+	if m.meta != nil {
+		mp = &metaParser{}
+		drv.metaFeed = mp.feed
+	}
 	short, err := drv.UploadToSD(ctx, localPath, longName, m.Names, func(sent, total int64) {
 		m.mu.Lock()
 		if m.job == job {
@@ -496,6 +531,9 @@ func (m *Manager) runSD(ctx context.Context, drv *Driver, job *Job, localPath, l
 		}
 		m.mu.Unlock()
 	})
+	if mp != nil {
+		drv.metaFeed = nil
+	}
 	if err != nil {
 		m.failJob(job, "upload failed: "+err.Error())
 		return
@@ -503,6 +541,12 @@ func (m *Manager) runSD(ctx context.Context, drv *Driver, job *Job, localPath, l
 	if err := m.Names.Save(); err != nil {
 		// Non-fatal: the file is on the card, only the long name is lost.
 		log.Printf("gonkd: saving name map: %v", err)
+	}
+	if mp != nil {
+		meta, png := mp.result()
+		if err := m.meta.Save(short, meta, png); err != nil {
+			log.Printf("gonkd: saving metadata for %s: %v", short, err)
+		}
 	}
 	if !startPrint {
 		m.finishJob(job)
@@ -987,12 +1031,32 @@ func (m *Manager) Console() []string {
 	return []string{}
 }
 
-// SDFiles returns the last SD listing, empty while disconnected.
-func (m *Manager) SDFiles() []SDFile {
+// ConsoleSince returns console lines recorded after the given total count,
+// plus the new total to pass on the next call. It is empty while
+// disconnected, and the count resets (silently, from the caller's point of
+// view) across a reconnect: since is always compared against whichever
+// Driver is currently attached.
+func (m *Manager) ConsoleSince(since int64) ([]string, int64) {
 	if drv := m.driver(); drv != nil {
-		return drv.SDFiles()
+		return drv.ConsoleSince(since)
 	}
-	return []SDFile{}
+	return nil, 0
+}
+
+// SDFiles returns the last SD listing, empty while disconnected, annotated
+// with any stored slicer metadata (see MetaStore).
+func (m *Manager) SDFiles() []SDFile {
+	drv := m.driver()
+	if drv == nil {
+		return []SDFile{}
+	}
+	files := drv.SDFiles()
+	if m.meta != nil {
+		for i := range files {
+			files[i].Meta = m.meta.Get(files[i].Short)
+		}
+	}
+	return files
 }
 
 // activeDriver returns the driver when no job runs.
@@ -1040,6 +1104,132 @@ func (m *Manager) DeleteFile(short string) error {
 	if err := m.Names.Save(); err != nil {
 		log.Printf("gonkd: saving name map: %v", err)
 	}
+	if m.meta != nil {
+		m.meta.Delete(short)
+	}
 	_ = drv.RefreshFiles()
 	return nil
+}
+
+// maxLongNameLen bounds a user-supplied long name from RenameFile; longer
+// than this is almost certainly a mistake, not a real filename.
+const maxLongNameLen = 255
+
+// RenameFile sets the long (display) name remembered for a file already on
+// the SD card. It never touches the card itself: Marlin only ever sees the
+// 8.3 short name.
+func (m *Manager) RenameFile(short, long string) error {
+	short = strings.ToUpper(strings.TrimSpace(short))
+	if !valid83(short) {
+		return ErrInvalidCommand
+	}
+	long = strings.TrimSpace(long)
+	if long == "" || len(long) > maxLongNameLen {
+		return ErrInvalidCommand
+	}
+	drv := m.driver()
+	if drv == nil {
+		return ErrDisconnected
+	}
+	found := false
+	for _, f := range drv.SDFiles() {
+		if f.Short == short {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ErrUnknownFile
+	}
+	m.Names.Rename(short, long)
+	if err := m.Names.Save(); err != nil {
+		log.Printf("gonkd: saving name map: %v", err)
+	}
+	drv.PatchLongName(short, long)
+	return nil
+}
+
+// Tune applies live speed/flow/fan overrides via M220/M221/M106/M107. A
+// nil pointer leaves that value unchanged. Values are assumed already
+// validated by the caller (api.handleTune) against the contract's ranges.
+func (m *Manager) Tune(speed, flow, fan *int) error {
+	var cmds []string
+	if speed != nil {
+		cmds = append(cmds, fmt.Sprintf("M220 S%d", *speed))
+	}
+	if flow != nil {
+		cmds = append(cmds, fmt.Sprintf("M221 S%d", *flow))
+	}
+	if fan != nil {
+		if *fan <= 0 {
+			cmds = append(cmds, "M107")
+		} else {
+			pwm := int(math.Round(float64(*fan) * 255 / 100))
+			cmds = append(cmds, fmt.Sprintf("M106 S%d", pwm))
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	if err := m.SendSequence(cmds); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if speed != nil {
+		m.speed = *speed
+	}
+	if flow != nil {
+		m.flow = *flow
+	}
+	if fan != nil {
+		m.fan = *fan
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// Heat sets hotend/bed target temperatures via M104/M140 (no wait, no
+// blocking on the target being reached). A nil pointer leaves that heater
+// alone; 0 turns it off. Values are assumed already validated by the
+// caller (api.handleHeat) against the contract's ranges. Heater commands
+// only ever reach here from an explicit call to this method.
+func (m *Manager) Heat(hotend, bed *float64) error {
+	var cmds []string
+	if hotend != nil {
+		cmds = append(cmds, "M104 S"+formatMM(*hotend))
+	}
+	if bed != nil {
+		cmds = append(cmds, "M140 S"+formatMM(*bed))
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return m.SendSequence(cmds)
+}
+
+// Presets returns the current heat presets (defaults, if none were ever
+// configured).
+func (m *Manager) Presets() []Preset {
+	if m.presets == nil {
+		return defaultPresets()
+	}
+	return m.presets.List()
+}
+
+// SetPresets validates and replaces the whole preset list, persisting it to
+// flash if it changed.
+func (m *Manager) SetPresets(list []Preset) error {
+	if m.presets == nil {
+		m.presets = NewPresetStore("")
+	}
+	return m.presets.Set(list)
+}
+
+// ThumbPath returns the on-disk path of short's stored thumbnail PNG, and
+// whether one exists.
+func (m *Manager) ThumbPath(short string) (string, bool) {
+	if m.meta == nil || !valid83(short) {
+		return "", false
+	}
+	return m.meta.ThumbPath(short)
 }

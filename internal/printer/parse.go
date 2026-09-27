@@ -139,6 +139,36 @@ func is83Char(c byte) bool {
 	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '~'
 }
 
+// ParseFirmwareName extracts the FIRMWARE_NAME value from an M115 reply
+// line, e.g.
+//
+//	FIRMWARE_NAME:Marlin 2.1.2.7 (Github) SOURCE_CODE_URL:https://github.com/MarlinFirmware/Marlin PROTOCOL_VERSION:1.0 MACHINE_TYPE:... EXTRUDER_COUNT:1 UUID:...
+//
+// yields "Marlin 2.1.2.7": Marlin packs several KEY:value fields on one
+// line, so the value runs until the next recognized key, and a trailing
+// "(Github)"-style parenthetical is dropped too.
+func ParseFirmwareName(line string) (string, bool) {
+	const marker = "FIRMWARE_NAME:"
+	idx := strings.Index(line, marker)
+	if idx < 0 {
+		return "", false
+	}
+	rest := line[idx+len(marker):]
+	for _, key := range []string{"SOURCE_CODE_URL:", "PROTOCOL_VERSION:", "MACHINE_TYPE:", "EXTRUDER_COUNT:", "UUID:"} {
+		if i := strings.Index(rest, key); i >= 0 {
+			rest = rest[:i]
+		}
+	}
+	if i := strings.IndexByte(rest, '('); i >= 0 {
+		rest = rest[:i]
+	}
+	name := strings.TrimSpace(rest)
+	if name == "" {
+		return "", false
+	}
+	return name, true
+}
+
 // ParseCapability parses M115 EXTENDED_CAPABILITIES_REPORT lines of the
 // form "Cap:AUTOREPORT_TEMP:1".
 func ParseCapability(line string) (name string, enabled bool, ok bool) {

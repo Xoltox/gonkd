@@ -103,3 +103,17 @@ func TestParseCapability(t *testing.T) {
 		t.Fatalf("name=%q enabled=%v ok=%v", name, enabled, ok)
 	}
 }
+
+func TestParseFirmwareName(t *testing.T) {
+	line := "FIRMWARE_NAME:Marlin 2.1.2.7 (Github) SOURCE_CODE_URL:https://github.com/MarlinFirmware/Marlin PROTOCOL_VERSION:1.0 MACHINE_TYPE:Creality EXTRUDER_COUNT:1 UUID:cede2a2f-41a2-4748-9b12-c55c62f367ff"
+	name, ok := ParseFirmwareName(line)
+	if !ok || name != "Marlin 2.1.2.7" {
+		t.Fatalf("name=%q ok=%v", name, ok)
+	}
+}
+
+func TestParseFirmwareNameNoMatch(t *testing.T) {
+	if _, ok := ParseFirmwareName("ok"); ok {
+		t.Fatal("expected no match")
+	}
+}

@@ -101,8 +101,18 @@ type Driver struct {
 	inFileList bool
 	listSeq    atomic.Uint64 // bumped at every "End file list"
 
-	names   *NameMap // optional: resolves short->long for listing display
-	onEvent func(Event, string)
+	names    *NameMap // optional: resolves short->long for listing display
+	onEvent  func(Event, string)
+	firmware string // FIRMWARE_NAME from M115, e.g. "Marlin 2.1.2.7"
+
+	consoleTotal int64 // total lines ever recorded, guarded by mu (see ConsoleSince)
+
+	// metaFeed, when non-nil, is fed every raw source line of an SD upload
+	// (UploadToSD/uploadASCII) as it streams by, so slicer-comment metadata
+	// (Job.go's metaParser) can be parsed without buffering the file. Only
+	// the upload goroutine touches it, and only while it exclusively holds
+	// the port (see beginUpload/endUpload), so no lock is needed.
+	metaFeed func(line string)
 
 	// wmu orders writes: a line is numbered (window.Prepare) and written
 	// under it, and resend replays/resyncs hold it, so the wire always sees
@@ -744,6 +754,12 @@ func (d *Driver) parseInfo(raw string) {
 		}
 	}
 
+	if name, ok := ParseFirmwareName(trimmed); ok {
+		d.mu.Lock()
+		d.firmware = name
+		d.mu.Unlock()
+		return
+	}
 	if t, ok := ParseTemps(trimmed); ok {
 		d.mu.Lock()
 		t.UpdatedAt = time.Now()
@@ -789,6 +805,7 @@ func (d *Driver) recordConsole(line string) {
 	line = strings.TrimRight(line, "\r\n")
 	d.mu.Lock()
 	d.lastLines = append(d.lastLines, line)
+	d.consoleTotal++
 	if len(d.lastLines) > consoleBacklog {
 		d.lastLines = d.lastLines[len(d.lastLines)-consoleBacklog:]
 	}
@@ -836,6 +853,49 @@ func (d *Driver) Capabilities() map[string]bool {
 		out[k] = v
 	}
 	return out
+}
+
+// Firmware returns the FIRMWARE_NAME reported by M115, or "" if none has
+// been seen yet.
+func (d *Driver) Firmware() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.firmware
+}
+
+// ConsoleSince returns the console lines recorded after the given total
+// count (0 means from whatever is still buffered), plus the new total to
+// pass on the next call. If more lines were recorded than the console
+// backlog holds, the oldest ones are silently skipped: a caller polling
+// regularly (the SSE console feed) never falls behind by more than one
+// gap.
+func (d *Driver) ConsoleSince(since int64) ([]string, int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	total := d.consoleTotal
+	have := int64(len(d.lastLines))
+	start := since - (total - have)
+	if start < 0 {
+		start = 0
+	}
+	if start >= have {
+		return nil, total
+	}
+	out := make([]string, have-start)
+	copy(out, d.lastLines[start:])
+	return out, total
+}
+
+// PatchLongName updates the long name of an already-listed file in place,
+// e.g. after a rename, without a fresh M20 round trip to the printer.
+func (d *Driver) PatchLongName(short, long string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := range d.sdFiles {
+		if d.sdFiles[i].Short == short {
+			d.sdFiles[i].Long = long
+		}
+	}
 }
 
 // lineReader reads '\n'-terminated lines of at most maxLineLen bytes. A

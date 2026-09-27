@@ -5,6 +5,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,20 +18,25 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Xoltox/gonkd/internal/printer"
 )
 
-const gonkdVersion = "0.1.0"
+const gonkdVersion = printer.Version
 
 // Server wires the Manager to HTTP handlers.
 type Server struct {
-	Mgr        *printer.Manager
-	DataDir    string             // for staging uploads before transfer
-	MaxBody    int64              // upload size cap in bytes; <= 0 means no cap
-	Mode       printer.UploadMode // default upload mode (sd or stream)
-	AllowHosts []string           // extra Host header values allowed besides IP literals and localhost
+	Mgr         *printer.Manager
+	DataDir     string             // for staging uploads before transfer
+	MaxBody     int64              // upload size cap in bytes; <= 0 means no cap
+	Mode        printer.UploadMode // default upload mode (sd or stream)
+	AllowHosts  []string           // extra Host header values allowed besides IP literals and localhost
+	AllowStream bool               // gate on stream-mode uploads/prints (-allow-stream)
+
+	hubOnce sync.Once
+	hub     *hub
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
@@ -66,8 +72,11 @@ func writeErr(w http.ResponseWriter, err error) {
 		code = http.StatusConflict
 	case errors.Is(err, printer.ErrClosed):
 		code = http.StatusConflict
-	case errors.Is(err, printer.ErrInvalidCommand), errors.Is(err, printer.ErrInvalidMode):
+	case errors.Is(err, printer.ErrInvalidCommand), errors.Is(err, printer.ErrInvalidMode),
+		errors.Is(err, printer.ErrTooManyPresets), errors.Is(err, printer.ErrInvalidPreset):
 		code = http.StatusBadRequest
+	case errors.Is(err, printer.ErrUnknownFile):
+		code = http.StatusNotFound
 	case errors.Is(err, printer.ErrTimeout):
 		code = http.StatusServiceUnavailable
 	}
@@ -90,6 +99,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/gonkd/console", s.handleConsole)
 	mux.HandleFunc("/gonkd/files", s.handleSDFiles)
 	mux.HandleFunc("/gonkd/files/delete", s.handleSDDelete)
+	mux.HandleFunc("/gonkd/files/rename", s.handleSDRename)
+	mux.HandleFunc("/gonkd/files/thumb", s.handleSDThumb)
 	mux.HandleFunc("/gonkd/job/pause", s.handleJobPause)
 	mux.HandleFunc("/gonkd/job/resume", s.handleJobResume)
 	mux.HandleFunc("/gonkd/job/cancel", s.handleJobCancel)
@@ -97,6 +108,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/gonkd/emergency", s.handleEmergency)
 	mux.HandleFunc("/gonkd/babystep", s.handleBabystep)
 	mux.HandleFunc("/gonkd/jog", s.handleJog)
+	mux.HandleFunc("/gonkd/tune", s.handleTune)
+	mux.HandleFunc("/gonkd/heat", s.handleHeat)
+	mux.HandleFunc("/gonkd/presets", s.handlePresets)
+	mux.HandleFunc("/gonkd/events", s.handleEvents)
 }
 
 // --- CSRF / Host hardening (SEC-5, SEC-25) ---
@@ -109,9 +124,15 @@ func (s *Server) Routes(mux *http.ServeMux) {
 // while blocking a browser tab on some unrelated DNS name from driving gonkd
 // via a cross-site fetch/form.
 func (s *Server) checkMutation(w http.ResponseWriter, r *http.Request, requireJSON bool) bool {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed, POST required", http.StatusMethodNotAllowed)
+	return s.checkMutationMethod(w, r, http.MethodPost, requireJSON)
+}
+
+// checkMutationMethod is checkMutation generalized to a method other than
+// POST, for /gonkd/presets's PUT.
+func (s *Server) checkMutationMethod(w http.ResponseWriter, r *http.Request, method string, requireJSON bool) bool {
+	if r.Method != method {
+		w.Header().Set("Allow", method)
+		http.Error(w, "method not allowed, "+method+" required", http.StatusMethodNotAllowed)
 		return false
 	}
 	if !isAllowedHost(r.Host, s.AllowHosts) {
@@ -415,6 +436,50 @@ func (s *Server) handleSDDelete(w http.ResponseWriter, r *http.Request) {
 	noContent(w)
 }
 
+func (s *Server) handleSDRename(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+		Long string `json:"long"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" || body.Long == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.Mgr.RenameFile(body.Name, body.Long); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+// handleSDThumb implements GET /gonkd/files/thumb?name=SHORT: the stored
+// thumbnail PNG for one SD file, or 404 if none was parsed for it.
+func (s *Server) handleSDThumb(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	short := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("name")))
+	path, ok := s.Mgr.ThumbPath(short)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	// no-cache: a new upload can reuse the same 8.3 name.
+	w.Header().Set("Cache-Control", "no-cache")
+	http.ServeContent(w, r, short+".png", time.Time{}, bytes.NewReader(data))
+}
+
 func (s *Server) handleJobPause(w http.ResponseWriter, r *http.Request) {
 	if !s.checkMutation(w, r, false) {
 		return
@@ -556,6 +621,96 @@ func (s *Server) handleJog(w http.ResponseWriter, r *http.Request) {
 	noContent(w)
 }
 
+// handleTune implements POST /gonkd/tune {"speed"?,"flow"?,"fan"?}: live
+// M220/M221/M106-M107 overrides. Each field is optional; an out-of-range
+// value is rejected (400) without touching the others.
+func (s *Server) handleTune(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		Speed *int `json:"speed"`
+		Flow  *int `json:"flow"`
+		Fan   *int `json:"fan"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if body.Speed != nil && (*body.Speed < 10 || *body.Speed > 500) {
+		http.Error(w, "speed must be 10-500", http.StatusBadRequest)
+		return
+	}
+	if body.Flow != nil && (*body.Flow < 50 || *body.Flow > 200) {
+		http.Error(w, "flow must be 50-200", http.StatusBadRequest)
+		return
+	}
+	if body.Fan != nil && (*body.Fan < 0 || *body.Fan > 100) {
+		http.Error(w, "fan must be 0-100", http.StatusBadRequest)
+		return
+	}
+	if err := s.Mgr.Tune(body.Speed, body.Flow, body.Fan); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+// handleHeat implements POST /gonkd/heat {"hotend"?,"bed"?}: M104/M140, no
+// wait. 0 turns a heater off; sending both 0 is a full cooldown. Heater
+// commands are only ever sent in response to this explicit call.
+func (s *Server) handleHeat(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		Hotend *float64 `json:"hotend"`
+		Bed    *float64 `json:"bed"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if body.Hotend != nil && (*body.Hotend < 0 || *body.Hotend > 260) {
+		http.Error(w, "hotend must be 0-260", http.StatusBadRequest)
+		return
+	}
+	if body.Bed != nil && (*body.Bed < 0 || *body.Bed > 110) {
+		http.Error(w, "bed must be 0-110", http.StatusBadRequest)
+		return
+	}
+	if err := s.Mgr.Heat(body.Hotend, body.Bed); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+// handlePresets implements GET/PUT /gonkd/presets.
+func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, 200, s.Mgr.Presets())
+	case http.MethodPut:
+		if !s.checkMutationMethod(w, r, http.MethodPut, true) {
+			return
+		}
+		var list []printer.Preset
+		if err := json.NewDecoder(r.Body).Decode(&list); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := s.Mgr.SetPresets(list); err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, s.Mgr.Presets())
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func clamp(v, lo, hi float64) float64 {
 	if v < lo {
 		return lo
@@ -580,6 +735,10 @@ func (s *Server) handleUploadCommon(w http.ResponseWriter, r *http.Request, mode
 	}
 	if mode != printer.ModeSDUpload && mode != printer.ModeStream {
 		http.Error(w, fmt.Sprintf("unknown upload mode %q", modeParam), http.StatusBadRequest)
+		return
+	}
+	if mode == printer.ModeStream && !s.AllowStream {
+		http.Error(w, "stream mode disabled", http.StatusBadRequest)
 		return
 	}
 

@@ -31,6 +31,9 @@ func main() {
 	defaultMode := flag.String("default-mode", "sd", "default upload mode: sd or stream")
 	bufsize := flag.Int("bufsize", 16, "outstanding-line budget; match Marlin's BUFSIZE")
 	allowHost := flag.String("allow-host", "", "extra Host header values to accept, comma-separated (IP literals and localhost are always accepted)")
+	metaDir := flag.String("meta-dir", "/etc/gonkd/meta", "dir for parsed SD file metadata/thumbnails (1MB cap, oldest evicted)")
+	presetsFile := flag.String("presets-file", "/etc/gonkd/presets.json", "heat presets file")
+	allowStream := flag.Bool("allow-stream", false, "allow stream-mode uploads/prints (off by default: headless fragments would run as live G-code)")
 	flag.Parse()
 
 	// This box has ~128MB RAM and no swap worth mentioning; a lower GC
@@ -47,6 +50,8 @@ func main() {
 
 	names := printer.NewNameMap(*namesFile)
 	mgr := printer.NewManager(names)
+	mgr.SetMetaStore(printer.NewMetaStore(*metaDir))
+	mgr.SetPresetStore(printer.NewPresetStore(*presetsFile))
 
 	// The printer may be off or unplugged; the link retries in the
 	// background and the HTTP server comes up regardless.
@@ -71,16 +76,18 @@ func main() {
 	}
 
 	srv := &api.Server{
-		Mgr:        mgr,
-		DataDir:    *dataDir,
-		MaxBody:    int64(*maxUploadMB) << 20,
-		Mode:       mode,
-		AllowHosts: hosts,
+		Mgr:         mgr,
+		DataDir:     *dataDir,
+		MaxBody:     int64(*maxUploadMB) << 20,
+		Mode:        mode,
+		AllowHosts:  hosts,
+		AllowStream: *allowStream,
 	}
 
 	mux := http.NewServeMux()
 	srv.Routes(mux)
 	mux.Handle("/", web.Handler())
+	go srv.RunEvents(ctx)
 
 	httpSrv := &http.Server{
 		Addr:              *listen,

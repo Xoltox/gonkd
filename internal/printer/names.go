@@ -158,6 +158,20 @@ func (m *NameMap) AssignAvoiding(long string, taken func(string) bool) string {
 	return short
 }
 
+// Rename sets (creating the entry if needed) the long name remembered for
+// short, e.g. after the user renames a file in the UI. It never touches
+// the SD card: Marlin only ever sees the 8.3 short name.
+func (m *NameMap) Rename(short, long string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	short = strings.ToUpper(short)
+	e := m.entries[short]
+	e.Short = short
+	e.Long = long
+	m.entries[short] = e
+	m.dirty = true
+}
+
 // Forget removes a mapping, e.g. after the file is deleted from the SD card.
 func (m *NameMap) Forget(short string) {
 	m.mu.Lock()
