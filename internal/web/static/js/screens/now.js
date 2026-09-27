@@ -72,6 +72,21 @@ function thumb(s, name, size) {
   return img;
 }
 
+// Finds the next pause point (M0/M1/M600/M601/M25/@pause, from the file's
+// stored meta.pauses) ahead of the job's current byte position, and
+// estimates when it will be reached from the current bytes/sec rate.
+function nextPauseInfo(job, meta) {
+  if (!job || !meta || !meta.pauses || !meta.pauses.length || !job.totalBytes) return null;
+  const next = meta.pauses.find((pt) => pt.offset > job.sentBytes);
+  if (!next) return null;
+  let eta = null;
+  if (job.sentBytes > 0 && job.elapsedSec > 0) {
+    const rate = job.sentBytes / job.elapsedSec; // bytes/sec so far
+    if (rate > 0) eta = Math.max(0, (next.offset - job.sentBytes) / rate);
+  }
+  return { layer: next.layer, msg: next.msg || next.cmd, eta };
+}
+
 function runningCard(s, p, live) {
   const job = s.snap.job;
   if (!job) return card(null, null, h('p', { text: 'Waiting for job details...' }));
@@ -81,6 +96,7 @@ function runningCard(s, p, live) {
   const num = h('span', { class: 'display-xl' });
   const big = h('div', { class: 'big-pct' }, num, h('span', { class: 'pct-sign', text: '%' }));
   const pb = bar('Print progress', heating ? 'indeterminate' : p === 'paused' ? 'paused' : '');
+  const nextPause = h('p', { class: 'meta' });
   const time = (label) => {
     const dd = h('dd', { class: 'num-l tnum', text: '--' });
     return { el: h('div', null, h('dt', { text: label }), dd), dd };
@@ -104,6 +120,9 @@ function runningCard(s, p, live) {
     setText(ll.dd, showLive ? dur(j.etaSec) : '--');
     const left = showLive ? j.etaSec : leftSlicer;
     setText(da.dd, left != null ? clock(Date.now() + left * 1000) : '--');
+    const np = nextPauseInfo(j, f && f.meta);
+    nextPause.hidden = !np;
+    if (np) setText(nextPause, `Next pause: layer ${np.layer || '?'}, ${np.msg}${np.eta != null ? ` - about ${dur(np.eta)}` : ''}`);
   });
   return card(null, null, [
     h('div', { class: 'job-top' },
@@ -114,6 +133,7 @@ function runningCard(s, p, live) {
     pb.el,
     heating && h('p', { class: 'meta', text: 'Heating up before the first layer. The print starts on its own.' }),
     p === 'paused' && h('p', { class: 'meta' }, icon('pause', 16), ' Paused. The nozzle may ooze; resume soon or cancel.'),
+    nextPause,
     h('dl', { class: 'times' }, el.el, ls.el, ll.el, da.el),
   ], { class: 'job' });
 }

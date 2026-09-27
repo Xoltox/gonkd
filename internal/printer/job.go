@@ -86,6 +86,15 @@ type Manager struct {
 
 	meta    *MetaStore   // optional: slicer metadata/thumbnails for SD files
 	presets *PresetStore // optional: heat presets; Presets() falls back to defaults if nil
+
+	// userWait, promptOpen, lastBusyAt, userWaitBytes and consoleSeen are
+	// scanUserWait's state: Marlin blocked at an M0/M1 (or a
+	// HOST_PROMPT_SUPPORT dialog) waiting for the user.
+	userWait      *UserWait
+	promptOpen    bool      // a HOST_PROMPT_SUPPORT dialog is open; Continue also sends M876 S0
+	lastBusyAt    time.Time // last busy/prompt line seen, for the userWaitClear timeout
+	userWaitBytes int64     // SD byte progress when userWait was set; a later advance clears it
+	consoleSeen   int64     // ConsoleSince cursor for scanUserWait
 }
 
 func NewManager(names *NameMap) *Manager {
@@ -128,6 +137,9 @@ func (m *Manager) Attach(d *Driver) {
 	m.drv = d
 	m.sdIgnore = false
 	m.speed, m.flow, m.fan = 100, 100, 0
+	m.userWait = nil
+	m.promptOpen = false
+	m.consoleSeen = 0
 	switch {
 	case m.job != nil && m.reconcile:
 		// Wait for the first M27 report to say whether it still runs.
@@ -144,6 +156,8 @@ func (m *Manager) Detach(reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.drv = nil
+	m.userWait = nil
+	m.promptOpen = false
 	job := m.job
 	switch {
 	case job == nil:
@@ -198,6 +212,11 @@ func (m *Manager) Snapshot() Snapshot {
 		j := *m.job
 		job = &j
 	}
+	var userWait *UserWait
+	if m.userWait != nil {
+		uw := *m.userWait
+		userWait = &uw
+	}
 	m.mu.Unlock()
 
 	if job != nil {
@@ -214,6 +233,7 @@ func (m *Manager) Snapshot() Snapshot {
 		LastError: lastErr,
 		Tune:      Tune{Speed: speed, Flow: flow, Fan: fan},
 		Limits:    Limits{HotendMax: hotendMaxC, BedMax: bedMaxC},
+		UserWait:  userWait,
 	}
 	if drv != nil {
 		snap.Temps = drv.Temps()
@@ -236,6 +256,7 @@ func (m *Manager) sync() {
 	if drv == nil {
 		return
 	}
+	m.scanUserWait(drv)
 	st := drv.SDStatus()
 	m.mu.Lock()
 	var lcd *Job
@@ -300,6 +321,14 @@ func (m *Manager) refreshLocked(st SDStatus) *Job {
 			j.Note = ""
 		}
 		setSDProgress(j, st)
+		// "ok progress after resume": Marlin only advances its SD read
+		// position once it is actually executing G-code again, so this is
+		// as good a signal as the busy line falling silent that the M0/M1
+		// wait ended.
+		if m.userWait != nil && st.Current > m.userWaitBytes {
+			m.userWait = nil
+			m.promptOpen = false
+		}
 	case st.NotSD:
 		switch {
 		case m.reconcile:
@@ -320,6 +349,107 @@ func setSDProgress(j *Job, st SDStatus) {
 	if st.Total > 0 {
 		j.Progress = float64(st.Current) / float64(st.Total) * 100
 	}
+}
+
+// userWaitDefaultMsg is shown when Marlin is blocked at an M0/M1 with no
+// message of its own to report: without HOST_PROMPT_SUPPORT, the "busy:
+// paused for user" keepalive carries no text (see ParsePromptBegin for the
+// case where a host prompt does supply one).
+const userWaitDefaultMsg = "Printer is waiting for you (M0/M1)"
+
+// userWaitClear: HOST_KEEPALIVE repeats "busy: paused for user" every 2s
+// while Marlin is genuinely waiting, so this much silence without a
+// prompt_end or SD-progress signal means the wait ended anyway (e.g. the
+// "ok" that would otherwise say so was missed). A var, like Driver's
+// stallAfter, so tests can shorten it.
+var userWaitClear = 5 * time.Second
+
+// scanUserWait watches new console lines for Marlin's M0/M1 busy-wait
+// keepalive and HOST_PROMPT_SUPPORT action lines, keeping Snapshot's
+// UserWait in sync. It is driven from sync() (polled by Snapshot and every
+// job-control call) rather than a Driver event callback: Console/
+// ConsoleSince is the only channel the Manager has onto raw printer lines
+// beyond the four already-defined Events, and adding a new Driver hook for
+// this was avoidable.
+func (m *Manager) scanUserWait(drv *Driver) {
+	m.mu.Lock()
+	since := m.consoleSeen
+	m.mu.Unlock()
+	lines, next := drv.ConsoleSince(since)
+	now := time.Now()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.consoleSeen = next
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		switch {
+		case BusyPausedForUser(line):
+			m.lastBusyAt = now
+			m.beginUserWaitLocked(now, userWaitDefaultMsg)
+		case IsPromptEnd(line):
+			m.userWait = nil
+			m.promptOpen = false
+		case IsPromptShow(line):
+			m.lastBusyAt = now
+		default:
+			if msg, ok := ParsePromptBegin(line); ok {
+				m.lastBusyAt = now
+				m.promptOpen = true
+				if msg == "" {
+					msg = userWaitDefaultMsg
+				}
+				m.beginUserWaitLocked(now, msg)
+			}
+		}
+	}
+	if m.userWait != nil && now.Sub(m.lastBusyAt) > userWaitClear {
+		m.userWait = nil
+		m.promptOpen = false
+	}
+}
+
+// beginUserWaitLocked starts userWait if it is not already active, logging
+// it once, or updates its message once a host prompt supplies a better one
+// than the generic default. Called with mu held.
+func (m *Manager) beginUserWaitLocked(now time.Time, msg string) {
+	if m.userWait == nil {
+		var bytes int64
+		if m.job != nil {
+			bytes = m.job.SentBytes
+		}
+		m.userWaitBytes = bytes
+		m.userWait = &UserWait{Since: now, Message: msg}
+		log.Printf("gonkd: printer waiting for user: %s", msg)
+		return
+	}
+	if msg != "" && msg != userWaitDefaultMsg {
+		m.userWait.Message = msg
+	}
+}
+
+// Continue answers Marlin waiting for the user: M108 breaks it out of the
+// M0/M1 wait_for_user loop, and (when a HOST_PROMPT_SUPPORT dialog is also
+// open) M876 S0 presses its first ("Continue") button. Both are
+// EMERGENCY_PARSER commands (gcode.EmergencyCommands) that Driver.Send
+// already routes straight to the wire via SendEmergency, bypassing the send
+// window entirely -- the same path Emergency uses for M112 -- so this
+// reaches Marlin even while it is blocked in M0 and not acking queued
+// lines. scanUserWait clears the banner once the busy line stops, SD
+// progress advances or a prompt_end arrives.
+func (m *Manager) Continue() error {
+	m.mu.Lock()
+	drv := m.drv
+	promptOpen := m.promptOpen
+	m.mu.Unlock()
+	if drv == nil {
+		return ErrDisconnected
+	}
+	cmds := []string{"M108"}
+	if promptOpen {
+		cmds = append(cmds, "M876 S0")
+	}
+	return m.SendSequence(cmds)
 }
 
 func (m *Manager) handleEvent(d *Driver, ev Event, line string) {

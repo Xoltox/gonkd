@@ -5,6 +5,7 @@ import { act, limitsOf, loadPresets } from '../store.js';
 import { api } from '../api.js';
 import { screenTitle } from './common.js';
 import { DEG } from '../fmt.js';
+import { getSoundAlerts, setSoundAlerts } from '../userwait.js';
 
 const THEME_KEY = 'gonkd-theme';
 
@@ -27,6 +28,12 @@ export function mount(root) {
     seg('Theme', [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], getTheme(), applyTheme),
     h('p', { class: 'meta', text: 'System follows your device. Saved in this browser only.' }),
   ]);
+  const soundToggle = h('input', { type: 'checkbox', checked: getSoundAlerts() });
+  soundToggle.addEventListener('change', () => setSoundAlerts(soundToggle.checked));
+  const alerts = card('Alerts', 'alert', [
+    h('label', { class: 'check' }, soundToggle, h('span', { text: 'Sound alerts when the printer is waiting for you' })),
+    h('p', { class: 'meta', text: 'A repeating beep and a blinking tab title while paused at an M0/M1. Needs a tap or key press on this page first (browsers block audio before that); saved in this browser only.' }),
+  ]);
   const about = region((s) => JSON.stringify([s.snap && s.snap.version, s.snap && s.snap.firmware, s.snap && s.snap.connected, s.link]), (s) => {
     const snap = s.snap || {};
     const row = (k, v) => h('div', null, h('dt', { text: k }), h('dd', { text: v }));
@@ -43,7 +50,7 @@ export function mount(root) {
       : h('p', { class: 'meta', text: 'Reported by the firmware (M115) once the printer connects.' }));
   });
   const presets = presetEditor();
-  root.append(screenTitle('Settings'), h('div', { class: 'settings-grid' }, theme, presets.el, about.el, caps.el));
+  root.append(screenTitle('Settings'), h('div', { class: 'settings-grid' }, theme, alerts, presets.el, about.el, caps.el));
   return (s) => { about.update(s); caps.update(s); presets.update(s); };
 }
 

@@ -830,3 +830,66 @@ func TestHeatSendsExpectedGcode(t *testing.T) {
 		t.Fatalf("bed command sent when only hotend was requested")
 	}
 }
+
+// ---- userWait (M0/M1 "waiting for user") ----
+
+func TestUserWaitDetectedFromBusyLine(t *testing.T) {
+	mgr, f := jtRig(t, nil)
+	f.emit("echo:busy: paused for user\n")
+	jtWait(t, "userWait set", func() bool { return mgr.Snapshot().UserWait != nil })
+	s := mgr.Snapshot()
+	if s.UserWait.Message != userWaitDefaultMsg {
+		t.Fatalf("Message = %q, want %q", s.UserWait.Message, userWaitDefaultMsg)
+	}
+}
+
+func TestUserWaitClearsAfterSilence(t *testing.T) {
+	old := userWaitClear
+	userWaitClear = 30 * time.Millisecond
+	defer func() { userWaitClear = old }()
+
+	mgr, f := jtRig(t, nil)
+	f.emit("echo:busy: paused for user\n")
+	jtWait(t, "userWait set", func() bool { return mgr.Snapshot().UserWait != nil })
+	jtWait(t, "userWait cleared after silence", func() bool { return mgr.Snapshot().UserWait == nil })
+}
+
+func TestUserWaitHostPromptBeginAndEnd(t *testing.T) {
+	mgr, f := jtRig(t, nil)
+	f.emit("//action:prompt_begin Change filament\n//action:prompt_show\n")
+	jtWait(t, "userWait set from prompt_begin", func() bool {
+		s := mgr.Snapshot()
+		return s.UserWait != nil && s.UserWait.Message == "Change filament"
+	})
+	f.emit("//action:prompt_end\n")
+	jtWait(t, "userWait cleared by prompt_end", func() bool { return mgr.Snapshot().UserWait == nil })
+}
+
+func TestContinueSendsM108(t *testing.T) {
+	mgr, f := jtRig(t, nil)
+	if err := mgr.Continue(); err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	jtWait(t, "M108 sent", func() bool { return f.count("M108") == 1 })
+	if f.count("M876") != 0 {
+		t.Fatalf("M876 sent without an open host prompt: %v", f.seen)
+	}
+}
+
+func TestContinueAlsoSendsM876WhenPromptOpen(t *testing.T) {
+	mgr, f := jtRig(t, nil)
+	f.emit("//action:prompt_begin Change filament\n")
+	jtWait(t, "prompt open", func() bool { return mgr.Snapshot().UserWait != nil })
+	if err := mgr.Continue(); err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	jtWait(t, "M108 sent", func() bool { return f.count("M108") == 1 })
+	jtWait(t, "M876 S0 sent", func() bool { return f.count("M876 S0") == 1 })
+}
+
+func TestContinueWhileDisconnected(t *testing.T) {
+	mgr := NewManager(NewNameMap(filepath.Join(t.TempDir(), "names.json")))
+	if err := mgr.Continue(); !errors.Is(err, ErrDisconnected) {
+		t.Fatalf("Continue err = %v, want ErrDisconnected", err)
+	}
+}

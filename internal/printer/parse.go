@@ -169,6 +169,40 @@ func ParseFirmwareName(line string) (string, bool) {
 	return name, true
 }
 
+// BusyPausedForUser reports whether line is Marlin's HOST_KEEPALIVE
+// keepalive sent every 2s while blocked in M0/M1's wait_for_user loop:
+// "echo:busy: paused for user". This firmware build has
+// ADVANCED_PAUSE_FEATURE off, so M600/M601 are not supported and never
+// produce this line; M0/M1 (with EMERGENCY_PARSER on) are the only pause
+// path gonkd can detect this way.
+func BusyPausedForUser(line string) bool {
+	return strings.Contains(line, "busy: paused for user")
+}
+
+// ParsePromptBegin parses a HOST_PROMPT_SUPPORT "//action:prompt_begin
+// <msg>" line (sent only if that Marlin feature is enabled), returning the
+// message, which may be empty.
+func ParsePromptBegin(line string) (string, bool) {
+	const marker = "//action:prompt_begin"
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, marker) {
+		return "", false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(trimmed, marker)), true
+}
+
+// IsPromptShow reports whether line is a "//action:prompt_show", sent once
+// a HOST_PROMPT_SUPPORT dialog's buttons are ready.
+func IsPromptShow(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "//action:prompt_show")
+}
+
+// IsPromptEnd reports whether line is a "//action:prompt_end", sent when a
+// HOST_PROMPT_SUPPORT dialog is dismissed (by M876 or otherwise).
+func IsPromptEnd(line string) bool {
+	return strings.TrimSpace(line) == "//action:prompt_end"
+}
+
 // ParseCapability parses M115 EXTENDED_CAPABILITIES_REPORT lines of the
 // form "Cap:AUTOREPORT_TEMP:1".
 func ParseCapability(line string) (name string, enabled bool, ok bool) {

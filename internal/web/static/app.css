@@ -214,6 +214,26 @@ input[aria-invalid="true"] { border-color: var(--danger); }
 .note.warn { color: var(--warn); }
 .stack { display: flex; flex-direction: column; gap: 12px; }
 
+/* ---- userwait (M0/M1 waiting-for-user alert) ---- */
+.userwait-host {
+  position: fixed; left: 0; right: 0; top: 0; z-index: 60;
+  background: var(--warn-bg); border-bottom: 2px solid var(--warn); box-shadow: 0 2px 12px rgb(0 0 0 / .2);
+}
+.userwait-host[hidden] { display: none; }
+.userwait-panel {
+  display: flex; gap: 14px; align-items: center; max-width: 900px; margin: 0 auto;
+  padding: 14px 16px calc(14px + env(safe-area-inset-top, 0px)); color: var(--warn);
+}
+.userwait-panel > .icon { flex: none; }
+.userwait-body { flex: 1; min-width: 0; color: var(--text-1); }
+.userwait-body strong { display: block; font-size: 1.0625rem; color: var(--warn); }
+.userwait-msg { font-weight: 500; margin: 2px 0; }
+.userwait-continue { flex: none; min-height: 56px; padding: 0 24px; font-size: 1rem; }
+@media (max-width: 640px) {
+  .userwait-panel { flex-wrap: wrap; }
+  .userwait-continue { width: 100%; order: 3; }
+}
+
 /* ---- banners, toasts, empty ---- */
 .banner { display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border-radius: var(--r-card); border: 1px solid; }
 .banner > .icon { margin-top: 1px; }

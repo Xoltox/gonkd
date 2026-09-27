@@ -87,16 +87,25 @@ type Limits struct {
 	BedMax    float64 `json:"bedMax"`
 }
 
+// UserWait describes Marlin blocked at an M0/M1 (or a HOST_PROMPT_SUPPORT
+// dialog it opened), waiting for the user to confirm via
+// POST /gonkd/job/continue. See Manager.scanUserWait.
+type UserWait struct {
+	Since   time.Time `json:"since"`
+	Message string    `json:"message"`
+}
+
 // Snapshot is the full point-in-time state returned by the JSON API.
 type Snapshot struct {
-	Version      string   `json:"version"`
-	State        State    `json:"state"`
-	Connected    bool     `json:"connected"`
-	Temps        Temps    `json:"temps"`
-	Job          *Job     `json:"job,omitempty"`
-	Capabilities []string `json:"capabilities,omitempty"`
-	LastError    string   `json:"lastError,omitempty"`
-	Firmware     string   `json:"firmware,omitempty"`
-	Tune         Tune     `json:"tune"`
-	Limits       Limits   `json:"limits"`
+	Version      string    `json:"version"`
+	State        State     `json:"state"`
+	Connected    bool      `json:"connected"`
+	Temps        Temps     `json:"temps"`
+	Job          *Job      `json:"job,omitempty"`
+	Capabilities []string  `json:"capabilities,omitempty"`
+	LastError    string    `json:"lastError,omitempty"`
+	Firmware     string    `json:"firmware,omitempty"`
+	Tune         Tune      `json:"tune"`
+	Limits       Limits    `json:"limits"`
+	UserWait     *UserWait `json:"userWait,omitempty"`
 }

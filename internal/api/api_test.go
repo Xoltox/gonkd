@@ -338,3 +338,27 @@ func TestStreamModeAllowedWithFlag(t *testing.T) {
 		t.Fatalf("staged file left behind: %v", entries)
 	}
 }
+
+// TestJobContinueDisconnectedConflict: past the CSRF/host gate, a
+// disconnected Manager's Continue() (see printer.Manager.Continue) surfaces
+// as 409, the same as the other job routes.
+func TestJobContinueDisconnectedConflict(t *testing.T) {
+	mux := newRouter(t)
+	req := httptest.NewRequest(http.MethodPost, "http://192.0.2.10/gonkd/job/continue", nil)
+	req.Host = "192.0.2.10"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+}
+
+func TestJobContinueRejectsGET(t *testing.T) {
+	mux := newRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/gonkd/job/continue", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}

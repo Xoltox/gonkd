@@ -117,3 +117,41 @@ func TestParseFirmwareNameNoMatch(t *testing.T) {
 		t.Fatal("expected no match")
 	}
 }
+
+func TestBusyPausedForUser(t *testing.T) {
+	if !BusyPausedForUser("echo:busy: paused for user") {
+		t.Fatal("expected match")
+	}
+	if BusyPausedForUser("echo:busy: processing") {
+		t.Fatal("expected no match for a plain busy: line")
+	}
+}
+
+func TestParsePromptBegin(t *testing.T) {
+	msg, ok := ParsePromptBegin("//action:prompt_begin Change filament")
+	if !ok || msg != "Change filament" {
+		t.Fatalf("msg=%q ok=%v", msg, ok)
+	}
+	if _, ok := ParsePromptBegin("//action:prompt_show"); ok {
+		t.Fatal("expected no match for prompt_show")
+	}
+}
+
+func TestParsePromptBeginEmptyMessage(t *testing.T) {
+	msg, ok := ParsePromptBegin("//action:prompt_begin")
+	if !ok || msg != "" {
+		t.Fatalf("msg=%q ok=%v", msg, ok)
+	}
+}
+
+func TestIsPromptShowAndEnd(t *testing.T) {
+	if !IsPromptShow("//action:prompt_show") {
+		t.Fatal("expected prompt_show match")
+	}
+	if !IsPromptEnd("//action:prompt_end") {
+		t.Fatal("expected prompt_end match")
+	}
+	if IsPromptEnd("//action:prompt_show") {
+		t.Fatal("prompt_show must not match IsPromptEnd")
+	}
+}

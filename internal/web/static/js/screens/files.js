@@ -1,6 +1,6 @@
 // Files: SD list with thumbnails and metadata, print, rename, delete, upload.
 import { h, icon, region, setText } from '../dom.js';
-import { card, btn, iconBtn, bar, holdButton, banner, sheet, empty, spinner, note } from '../ui.js';
+import { card, btn, iconBtn, bar, holdButton, confirmButton, banner, sheet, empty, spinner, note } from '../ui.js';
 import { phaseOf, act, jobActive, loadFiles, startUpload, cancelUpload, clearUpload, fileFor, connected, set } from '../store.js';
 import { api, thumbUrl } from '../api.js';
 import { screenTitle, pageBanners } from './common.js';
@@ -80,6 +80,7 @@ function fileRow(s, f) {
   if (m.hotendC || m.bedC) bits.push(`${m.hotendC ?? '--'} / ${m.bedC ?? '--'}${DEG}`);
   const limits = s.snap && s.snap.limits;
   const tooHot = m.hotendC && limits && m.hotendC > limits.hotendMax;
+  const unsupported = m.unsupported || [];
 
   const ph = h('div', { class: 'thumb thumb-s thumb-none', 'aria-hidden': 'true' }, icon('cube', 28));
   let th = ph;
@@ -97,9 +98,13 @@ function fileRow(s, f) {
       bits.length > 0 && h('p', { class: 'meta tnum', text: bits.join(DOT) }),
       h('p', { class: 'meta' }, h('span', { class: 'mono', text: f.short }), ' ', h('span', { class: 'tnum', text: bytes(f.bytes) }), m.slicer ? DOT + m.slicer : ''),
       locked && h('p', { class: 'meta c-hot' }, icon('play', 14), ' Printing now'),
-      tooHot && note('warn', `Sliced for ${m.hotendC}${DEG}, above this printer's limit.`)),
+      tooHot && note('warn', `Sliced for ${m.hotendC}${DEG}, above this printer's limit.`),
+      unsupported.length > 0 && note('warn', `Contains ${unsupported.join(', ')}, which this firmware skips: the print will not stop for the colour change.`)),
     h('div', { class: 'file-actions' },
-      btn('Print', { variant: 'primary', icon: 'play', disabled: !canPrint(s) || locked, onClick: () => act(() => api.print(f.short), `Printing ${name}`) }),
+      unsupported.length > 0
+        ? confirmButton('Print', 'Print anyway?', () => act(() => api.print(f.short), `Printing ${name}`),
+          { variant: 'primary', icon: 'play', disabled: !canPrint(s) || locked })
+        : btn('Print', { variant: 'primary', icon: 'play', disabled: !canPrint(s) || locked, onClick: () => act(() => api.print(f.short), `Printing ${name}`) }),
       more),
     open && h('div', { class: 'file-more' },
       btn('Rename', { icon: 'edit', disabled: locked, onClick: () => renameSheet(f) }),

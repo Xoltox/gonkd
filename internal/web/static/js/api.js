@@ -57,6 +57,7 @@ export const api = {
   print: (name) => post('/gonkd/job/print', { name }),
   pause: () => post('/gonkd/job/pause'),
   resume: () => post('/gonkd/job/resume'),
+  continue: () => post('/gonkd/job/continue'),
   cancel: () => post('/gonkd/job/cancel'),
   estop: () => post('/gonkd/emergency'),
   babystep: (deltaMm) => post('/gonkd/babystep', { deltaMm }),

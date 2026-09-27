@@ -103,6 +103,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/gonkd/files/thumb", s.handleSDThumb)
 	mux.HandleFunc("/gonkd/job/pause", s.handleJobPause)
 	mux.HandleFunc("/gonkd/job/resume", s.handleJobResume)
+	mux.HandleFunc("/gonkd/job/continue", s.handleJobContinue)
 	mux.HandleFunc("/gonkd/job/cancel", s.handleJobCancel)
 	mux.HandleFunc("/gonkd/job/print", s.handleJobPrint)
 	mux.HandleFunc("/gonkd/emergency", s.handleEmergency)
@@ -496,6 +497,22 @@ func (s *Server) handleJobResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Mgr.Resume(); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+// handleJobContinue implements POST /gonkd/job/continue: answers a printer
+// waiting for the user at an M0/M1 (see Manager.Continue). It must work
+// even while Marlin is blocked mid-print and not acking queued lines, the
+// same requirement /gonkd/emergency has for M112, so it goes through the
+// same checkMutation gate rather than any job-active check.
+func (s *Server) handleJobContinue(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, false) {
+		return
+	}
+	if err := s.Mgr.Continue(); err != nil {
 		writeErr(w, err)
 		return
 	}

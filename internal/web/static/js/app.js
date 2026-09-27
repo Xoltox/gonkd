@@ -1,6 +1,7 @@
 // Entry: mount the shell, route by hash, push state to the visible screen.
 import { state, subscribe, start } from './store.js';
 import { mountStrip, mountNav, mountToast, ROUTES } from './shell.js';
+import { mountUserWait } from './userwait.js';
 import * as now from './screens/now.js';
 import * as files from './screens/files.js';
 import * as control from './screens/control.js';
@@ -14,6 +15,7 @@ const main = document.getElementById('main');
 const updateStrip = mountStrip(document.getElementById('strip'));
 const updateNav = mountNav(document.getElementById('nav'));
 const updateToast = mountToast(document.getElementById('toast'));
+const updateUserWait = mountUserWait(document.getElementById('userwait'));
 
 let route = '';
 let updateScreen = () => {};
@@ -44,6 +46,7 @@ function render(s) {
   updateStrip(s);
   updateNav(s, route);
   updateToast(s);
+  updateUserWait(s);
   updateScreen(s);
 }
 

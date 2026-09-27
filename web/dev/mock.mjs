@@ -6,7 +6,7 @@
 //   PORT=8080 node web/dev/mock.mjs
 //
 // Force a state from the browser console or a tab:
-//   /__mock?s=idle|heating|printing|paused|finished|error|killed|disconnected|empty|uploadfail|offline|online
+//   /__mock?s=idle|heating|printing|paused|finished|error|killed|disconnected|empty|uploadfail|offline|online|waiting
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
@@ -22,7 +22,8 @@ const TYPES = {
 // ---- simulated printer ----
 const LIMITS = { hotendMax: 260, bedMax: 110 };
 let files = [
-  { short: 'BENCHY~1.GCO', long: 'benchy_0.2mm_PLA.gcode', bytes: 2841233, meta: { thumb: true, estSec: 5220, filamentG: 14.8, filamentMm: 4960, layerHeight: 0.2, nozzle: 0.4, hotendC: 205, bedC: 60, slicer: 'OrcaSlicer 2.2.0' } },
+  { short: 'BENCHY~1.GCO', long: 'benchy_0.2mm_PLA.gcode', bytes: 2841233, meta: { thumb: true, estSec: 5220, filamentG: 14.8, filamentMm: 4960, layerHeight: 0.2, nozzle: 0.4, hotendC: 205, bedC: 60, slicer: 'OrcaSlicer 2.2.0',
+    pauses: [{ offset: 1500000, layer: 40, cmd: 'M600', msg: 'Color change to red' }], unsupported: ['M600'] } },
   { short: 'CALCUB~1.GCO', long: 'calibration_cube_20mm.gcode', bytes: 512330, meta: { thumb: true, estSec: 1860, filamentG: 6.1, layerHeight: 0.2, nozzle: 0.4, hotendC: 200, bedC: 60, slicer: 'PrusaSlicer 2.8.1' } },
   { short: 'CABLEC~1.GCO', long: 'cable_clip_x8_PETG_long_name_that_wraps_on_small_phones.gcode', bytes: 1203880, meta: { estSec: 3420, filamentG: 9.4, layerHeight: 0.16, nozzle: 0.4, hotendC: 235, bedC: 80 } },
   { short: 'TEST.GCO', long: '', bytes: 4096 },
@@ -31,7 +32,7 @@ let presets = [{ name: 'PLA', hotend: 200, bed: 60 }, { name: 'PETG', hotend: 23
 const p = {
   state: 'idle', connected: true,
   temps: { HotendActual: 24.1, HotendTarget: 0, BedActual: 23.4, BedTarget: 0, FanPercent: 0 },
-  job: null, tune: { speed: 100, flow: 100, fan: 0 },
+  job: null, tune: { speed: 100, flow: 100, fan: 0 }, userWait: null,
   capabilities: ['AUTOREPORT_TEMP', 'AUTOREPORT_SD_STATUS', 'EEPROM', 'EMERGENCY_PARSER', 'SDCARD', 'LONG_FILENAME', 'BABYSTEPPING', 'PROMPT_SUPPORT', 'THERMAL_PROTECTION'],
   lastError: '', version: '0.1.0-dev', firmware: 'Marlin 2.1.2.7', limits: LIMITS,
 };
@@ -108,14 +109,15 @@ setInterval(() => {
     }
   }
   if (tick % 4 === 0 && p.connected) say(`T:${t.HotendActual.toFixed(2)} /${t.HotendTarget.toFixed(2)} B:${t.BedActual.toFixed(2)} /${t.BedTarget.toFixed(2)} @:0 B@:0`);
+  if (p.userWait) say('echo:busy: paused for user'); // HOST_KEEPALIVE, real Marlin repeats this every 2s
   pushStatus();
 }, 500);
 
 function scenario(s) {
   offline = false; uploadFail = false;
   const f = files[0];
-  p.connected = true; p.lastError = '';
-  const reset = () => { p.job = null; p.temps.HotendTarget = 0; p.temps.BedTarget = 0; };
+  p.connected = true; p.lastError = ''; p.userWait = null;
+  const reset = () => { p.job = null; p.temps.HotendTarget = 0; p.temps.BedTarget = 0; p.userWait = null; };
   switch (s) {
     case 'idle': p.state = 'idle'; reset(); break;
     case 'heating': startPrint(f); p.temps.HotendActual = 60; p.temps.BedActual = 30; break;
@@ -127,6 +129,11 @@ function scenario(s) {
     case 'disconnected': p.state = 'disconnected'; p.connected = false; reset(); break;
     case 'empty': files = []; p.state = 'idle'; reset(); break;
     case 'uploadfail': uploadFail = true; p.state = 'idle'; reset(); break;
+    case 'waiting':
+      scenario('printing');
+      p.userWait = { since: new Date().toISOString(), message: 'Change filament' };
+      say('echo:busy: paused for user');
+      break;
     case 'offline': offline = true; for (const c of clients) c.destroy(); clients.clear(); break;
     case 'online': break;
   }
@@ -213,6 +220,11 @@ async function api(req, res, url) {
     }
     case '/gonkd/job/pause': if (p.state !== 'printing') return fail(res, 409, 'not printing'); p.state = 'paused'; say('// action:paused'); return done(res);
     case '/gonkd/job/resume': if (p.state !== 'paused') return fail(res, 409, 'not paused'); p.state = 'printing'; say('// action:resumed'); return done(res);
+    case '/gonkd/job/continue':
+      if (!p.userWait) return fail(res, 409, 'not waiting for user');
+      p.userWait = null;
+      say('echo:Continuing...');
+      return done(res);
     case '/gonkd/job/cancel':
       if (!busy()) return fail(res, 409, 'no active job');
       p.state = 'cancelling'; upload = null;
