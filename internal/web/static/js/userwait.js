@@ -18,32 +18,39 @@ export function setSoundAlerts(on) {
 }
 
 // Browsers require a user gesture before audio can play; a page load alone
-// never counts, so a beep only ever fires after the visitor has touched or
-// typed on the page at least once.
-let gestureSeen = false;
+// never counts. The first touch or key press anywhere unlocks audio; until
+// then the banner offers an "Enable sound" button (soundReady() is false).
 let audioCtx = null;
 function unlock() {
-  gestureSeen = true;
   if (!audioCtx) {
-    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { /* no WebAudio */ }
-  } else if (audioCtx.state === 'suspended') {
-    audioCtx.resume().catch(() => {});
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { return; /* no WebAudio */ }
   }
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
 }
 ['pointerdown', 'keydown'].forEach((ev) => document.addEventListener(ev, unlock, { passive: true }));
 
-function beep() {
-  if (!gestureSeen || !getSoundAlerts() || !audioCtx) return;
-  const t0 = audioCtx.currentTime;
-  const osc = audioCtx.createOscillator();
-  const gain = audioCtx.createGain();
-  osc.frequency.value = 880;
-  gain.gain.setValueAtTime(0.0001, t0);
-  gain.gain.exponentialRampToValueAtTime(0.25, t0 + 0.02);
-  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.5);
-  osc.connect(gain).connect(audioCtx.destination);
-  osc.start(t0);
-  osc.stop(t0 + 0.55);
+export function soundReady() {
+  return !!audioCtx && audioCtx.state === 'running';
+}
+
+// beep plays three short tones. Mobile browsers may suspend the context when
+// the tab is hidden, so it tries to resume first.
+export function beep() {
+  if (!getSoundAlerts() || !audioCtx) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  const t = audioCtx.currentTime + 0.05;
+  for (let i = 0; i < 3; i++) {
+    const t0 = t + i * 0.35;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.4, t0 + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.25);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + 0.3);
+  }
 }
 
 const BASE_TITLE = document.title;
@@ -78,6 +85,11 @@ export function mountUserWait(root) {
       goBtn.disabled = false;
     },
   }, icon('play'), h('span', { text: 'Continue print' }));
+  const soundBtn = h('button', {
+    type: 'button', class: 'btn',
+    onclick: () => { unlock(); beep(); setTimeout(update, 300); },
+  }, h('span', { text: 'Enable sound' }));
+  const update = () => { soundBtn.hidden = !getSoundAlerts() || soundReady(); };
   root.append(
     h('div', { class: 'userwait-panel' },
       icon('pause', 28),
@@ -86,7 +98,7 @@ export function mountUserWait(root) {
         msg,
         time,
         h('p', { class: 'meta', text: 'Continues the print. Make sure the new filament is loaded first.' })),
-      goBtn),
+      h('div', { class: 'userwait-actions' }, goBtn, soundBtn)),
   );
   root.hidden = true;
 
@@ -102,6 +114,7 @@ export function mountUserWait(root) {
       }
       return;
     }
+    update();
     setText(msg, uw.message || 'Waiting for user');
     const since = new Date(uw.since).getTime();
     setText(time, isFinite(since) ? `Waiting since ${ago(Math.max(0, s.now - since))}` : '');

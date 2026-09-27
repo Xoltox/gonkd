@@ -228,10 +228,11 @@ input[aria-invalid="true"] { border-color: var(--danger); }
 .userwait-body { flex: 1; min-width: 0; color: var(--text-1); }
 .userwait-body strong { display: block; font-size: 1.0625rem; color: var(--warn); }
 .userwait-msg { font-weight: 500; margin: 2px 0; }
-.userwait-continue { flex: none; min-height: 56px; padding: 0 24px; font-size: 1rem; }
+.userwait-actions { flex: none; display: flex; flex-direction: column; gap: 8px; }
+.userwait-continue { min-height: 56px; padding: 0 24px; font-size: 1rem; }
 @media (max-width: 640px) {
   .userwait-panel { flex-wrap: wrap; }
-  .userwait-continue { width: 100%; order: 3; }
+  .userwait-actions { width: 100%; order: 3; }
 }
 
 /* ---- banners, toasts, empty ---- */
