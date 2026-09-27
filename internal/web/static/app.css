@@ -365,7 +365,13 @@ body:has(.has-actionbar) .toast-host { bottom: calc(var(--nav-h) + var(--bar-h) 
   display: flex; align-items: center; justify-content: center; border: 1px solid var(--border);
   border-radius: 4px; font-size: .8125rem; color: var(--text-1); min-height: 0; padding: 0;
 }
-.mesh-cell:disabled { opacity: .6; }
+.mesh-cell:disabled { opacity: .85; }
+.mesh-front { text-align: center; margin: 4px auto 0; max-width: 360px; }
+.mesh-legend { display: flex; align-items: center; gap: 8px; max-width: 360px; margin: 8px auto 0; }
+.mesh-legend-bar {
+  flex: 1; height: 10px; border-radius: 5px; border: 1px solid var(--border);
+  background: linear-gradient(to right, color-mix(in oklab, #f4eee6 8%, #1c1916), color-mix(in oklab, #f4eee6 92%, #1c1916));
+}
 .wizard-z { display: flex; align-items: baseline; gap: 4px; justify-content: center; margin: 8px 0; }
 .wizard-z .num-l { font-size: 2rem; }
 .wizard-zbtn { justify-self: center; }

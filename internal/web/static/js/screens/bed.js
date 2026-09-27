@@ -85,14 +85,18 @@ function heatmapCard() {
   const body = h('div', { class: 'mesh-body' });
   const editSheet = sheet('Edit point');
   const el = card('Mesh', 'layers', [body]);
-  function cellColor(v) {
-    if (!mesh || mesh.range <= 0) return '';
-    const mid = (mesh.min + mesh.max) / 2;
-    const t = Math.min(1, Math.abs(v - mid) / (mesh.range / 2 || 1));
-    const pct = Math.round(t * 65);
-    return v >= mid
-      ? `color-mix(in srgb, var(--hot-fill) ${pct}%, var(--surface-2))`
-      : `color-mix(in srgb, var(--bed-fill) ${pct}%, var(--surface-2))`;
+  // Monochrome ramp: dark = low, light = high, the way a relief map reads.
+  // Fixed colours (not theme tokens) so both themes read the same way.
+  function cellStyle(v) {
+    if (!mesh) return {};
+    const all = mesh.points.flat();
+    const mn = Math.min(...all), span = Math.max(...all) - mn;
+    const t = span > 0 ? (v - mn) / span : 0.5;
+    const pct = Math.round(8 + t * 84); // keep both ends off pure black/white
+    return {
+      background: `color-mix(in oklab, #f4eee6 ${pct}%, #1c1916)`,
+      color: t >= 0.5 ? '#1c1916' : '#f4eee6',
+    };
   }
   function editPoint(x, y) {
     const cur = mesh.points[y][x];
@@ -138,11 +142,13 @@ function heatmapCard() {
         : null;
       if (cachedNote) body.append(cachedNote);
       const grid = h('div', { class: 'mesh-grid' });
-      for (let y = 0; y < mesh.points.length; y++) {
+      // Marlin row 0 is the front (Y0): draw it last so the map faces the
+      // viewer like the printer does, matching the corner assistant.
+      for (let y = mesh.points.length - 1; y >= 0; y--) {
         for (let x = 0; x < mesh.points[y].length; x++) {
           const v = mesh.points[y][x];
           const cell = h('button', {
-            type: 'button', class: 'mesh-cell tnum', style: { background: cellColor(v) },
+            type: 'button', class: 'mesh-cell tnum', style: cellStyle(v),
             'aria-label': `Point X${x} Y${y}, ${v.toFixed(3)} millimetres. Tap to edit.`,
             disabled: !on,
             onclick: () => editPoint(x, y),
@@ -160,6 +166,9 @@ function heatmapCard() {
           h('span', { class: 'meta' }, 'Max ', h('span', { class: 'num-l tnum', text: mx.toFixed(3) })),
           h('span', { class: 'meta' }, 'Range ', h('span', { class: 'num-l tnum', text: (mx - mn).toFixed(3) }))),
         grid,
+        h('p', { class: 'meta mesh-front', text: 'Front of bed' }),
+        h('div', { class: 'mesh-legend meta' },
+          h('span', { text: 'Low' }), h('span', { class: 'mesh-legend-bar' }), h('span', { text: 'High' })),
       );
       if (rangeNote) body.append(rangeNote);
     },
