@@ -292,3 +292,16 @@ func TestSDFileMetaJSONOmitsEmptyFields(t *testing.T) {
 		t.Fatalf("empty SDMeta marshaled to %q, want {}", data)
 	}
 }
+
+func TestMetaPauseMessageIgnoresComment(t *testing.T) {
+	p := &metaParser{}
+	var off int64
+	for _, l := range []string{"M117 Swap to red", "M0 ; Pause and wait for click", "M0 Load white ; comment"} {
+		p.feed(l, off)
+		off += int64(len(l)) + 1
+	}
+	m, _ := p.result()
+	if len(m.Pauses) != 2 || m.Pauses[0].Msg != "Swap to red" || m.Pauses[1].Msg != "Load white" {
+		t.Fatalf("pauses = %+v", m.Pauses)
+	}
+}

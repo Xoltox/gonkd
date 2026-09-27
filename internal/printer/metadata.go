@@ -275,6 +275,7 @@ func (p *metaParser) feedComment(body string) {
 // hotend target and the first M140/M190 the bed target, matching what
 // Marlin itself would actually heat to.
 func (p *metaParser) feedCommand(t string) {
+	t = stripComment(t) // "M0 ; Pause and wait for click" has no message
 	if t == "" {
 		return
 	}
@@ -288,6 +289,9 @@ func (p *metaParser) feedCommand(t string) {
 	case word == "M117":
 		p.lastM117 = rest
 	case word == "M0" || word == "M1":
+		if rest == "" {
+			rest = p.lastM117
+		}
 		p.addPause(word, rest)
 	case word == "M600" || word == "M601":
 		p.addPause(word, p.lastM117)
