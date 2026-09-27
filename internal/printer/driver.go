@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Xoltox/gonkd/internal/binprotocol"
 	"github.com/Xoltox/gonkd/internal/gcode"
 )
 
@@ -131,6 +132,13 @@ type Driver struct {
 	m28      atomic.Int32 // upload open state, see m28* constants
 	writeErr atomic.Bool  // "error writing to file" seen during upload
 
+	// Binary transfer session (uploadBinary). binMode is changed under
+	// wmu; while it is set nothing but the session writes to the port and
+	// readLoop hands the protocol replies to binLines instead of the window.
+	binMode     atomic.Bool
+	binSwitched atomic.Bool // "Switching to Binary Protocol" seen
+	binLines    chan string
+
 	lastRX atomic.Int64 // unix nanos of the last complete line
 
 	acks        atomic.Uint64 // ok lines received, for the stall backoff
@@ -161,13 +169,14 @@ const (
 // BUFSIZE (16 for this firmware build) as the outstanding-line budget.
 func New(conn Conn, bufsize int) *Driver {
 	return &Driver{
-		conn:   conn,
-		lr:     lineReader{r: bufio.NewReaderSize(conn, maxLineLen)},
-		window: gcode.NewWindow(bufsize),
-		caps:   map[string]bool{},
-		sendCh: make(chan queuedCmd, queueLen),
-		notify: make(chan struct{}, 1),
-		dead:   make(chan struct{}),
+		conn:     conn,
+		lr:       lineReader{r: bufio.NewReaderSize(conn, maxLineLen)},
+		window:   gcode.NewWindow(bufsize),
+		caps:     map[string]bool{},
+		sendCh:   make(chan queuedCmd, queueLen),
+		notify:   make(chan struct{}, 1),
+		binLines: make(chan string, 256),
+		dead:     make(chan struct{}),
 
 		stallAfter:  stallAfter,
 		resendQuiet: resendQuiet,
@@ -504,7 +513,7 @@ func (d *Driver) pumpLoop() {
 			if held.gen != d.gen.Load() {
 				d.queued.Add(-1) // queued before a printer reset: drop
 				done = true
-			} else if d.window.CanSend() {
+			} else if d.window.CanSend() && !d.binMode.Load() {
 				_, framed := d.window.Prepare(held.cmd)
 				d.queued.Add(-1)
 				err = d.write(framed)
@@ -539,6 +548,9 @@ func (d *Driver) pumpLoop() {
 func (d *Driver) serviceResend() <-chan time.Time {
 	d.wmu.Lock()
 	defer d.wmu.Unlock()
+	if d.binMode.Load() {
+		return nil // ASCII would corrupt the packet stream
+	}
 	lines, resync, k, wait := d.window.TakeResend(d.resendQuiet)
 	if wait > 0 {
 		return time.After(wait)
@@ -575,7 +587,7 @@ func (d *Driver) checkStall(st *stallState) {
 	if d.acks.Load() != st.acks {
 		st.wait = d.stallAfter
 	}
-	if !d.window.Stalled(st.wait) {
+	if !d.window.Stalled(st.wait) || d.binMode.Load() {
 		return
 	}
 	d.wmu.Lock()
@@ -619,6 +631,10 @@ func (d *Driver) handleLine(raw string) {
 	d.lastRX.Store(time.Now().UnixNano())
 	d.recordConsole(raw)
 	resp := gcode.ParseLine(raw)
+	if d.binMode.Load() && resp.Kind != gcode.KindStart {
+		d.handleBinaryLine(raw)
+		return
+	}
 	switch resp.Kind {
 	case gcode.KindOK:
 		d.acks.Add(1)
@@ -679,6 +695,7 @@ func (d *Driver) resync() {
 	d.wmu.Lock()
 	d.qmu.Lock()
 	d.gen.Add(1)
+	d.binMode.Store(false) // Marlin boots in ASCII mode
 	for drained := false; !drained; {
 		select {
 		case <-d.sendCh:
@@ -784,7 +801,12 @@ func (d *Driver) parseInfo(raw string) {
 	case strings.HasPrefix(trimmed, "Writing to file:"):
 		d.m28.CompareAndSwap(m28Waiting, m28Opened)
 		d.changed.fire()
+	case strings.Contains(trimmed, "Switching to Binary Protocol"):
+		d.binSwitched.Store(true)
 	case strings.Contains(trimmed, "open failed"):
+		if d.binMode.Load() {
+			return // a binary OPEN failing; the session sees "PFT:fail"
+		}
 		// During an upload's M28 this is the upload's failure, not M23's.
 		if d.m28.CompareAndSwap(m28Waiting, m28Failed) {
 			d.changed.fire()
@@ -962,4 +984,88 @@ func (b *broadcast) fire() {
 		b.ch = nil
 	}
 	b.mu.Unlock()
+}
+
+// handleBinaryLine routes a line received during a binary session: the
+// protocol's replies go to the session, everything else (temperature and
+// SD autoreports, echo: chatter) is parsed as usual. Nothing reaches the
+// window: "ok3" would pop an ASCII line and "rs3" is not an ASCII resend.
+func (d *Driver) handleBinaryLine(raw string) {
+	if _, ok := binprotocol.ParseReply(raw); ok {
+		select {
+		case d.binLines <- raw:
+		default:
+			// The session reads continuously; a full buffer means it is
+			// gone, and a lost reply is recovered by its timeout anyway.
+			log.Printf("gonkd: binary transfer: reply dropped: %q", strings.TrimSpace(raw))
+		}
+		return
+	}
+	if resp := gcode.ParseLine(raw); resp.Kind == gcode.KindError {
+		log.Printf("gonkd: printer error: %s", resp.Message)
+	}
+	d.parseInfo(raw)
+}
+
+// enterBinary hands the port to a binary session. The caller must own the
+// upload and have seen Marlin switch ("M28 B1" acked).
+func (d *Driver) enterBinary(gen uint64) error {
+	d.wmu.Lock()
+	defer d.wmu.Unlock()
+	if d.gen.Load() != gen {
+		return errPrinterReset
+	}
+	for drained := false; !drained; {
+		select {
+		case <-d.binLines:
+		default:
+			drained = true
+		}
+	}
+	d.binMode.Store(true)
+	return nil
+}
+
+// leaveBinary gives the port back to the ASCII pump. Unless the printer
+// reset meanwhile, a bare newline goes out first: it ends any packet bytes
+// Marlin may have taken as the start of an ASCII line (see
+// binprotocol.Session.Exit); an empty line is ignored.
+func (d *Driver) leaveBinary(gen uint64) {
+	d.wmu.Lock()
+	if d.binMode.Load() && d.gen.Load() == gen {
+		_ = d.write("\n")
+	}
+	d.binMode.Store(false)
+	d.wmu.Unlock()
+	d.poke()
+	d.changed.fire()
+}
+
+// writeBinary writes one packet for the session of generation gen.
+func (d *Driver) writeBinary(gen uint64, p []byte) error {
+	d.wmu.Lock()
+	defer d.wmu.Unlock()
+	if d.gen.Load() != gen || !d.binMode.Load() {
+		return errPrinterReset
+	}
+	return d.write(string(p))
+}
+
+// linkCtx is parent, also cancelled when the driver dies.
+func (d *Driver) linkCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	if timeout > 0 {
+		var c2 context.CancelFunc
+		ctx, c2 = context.WithTimeout(ctx, timeout)
+		c1 := cancel
+		cancel = func() { c2(); c1() }
+	}
+	go func() {
+		select {
+		case <-d.dead:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }

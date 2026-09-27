@@ -34,6 +34,7 @@ func main() {
 	metaDir := flag.String("meta-dir", "/etc/gonkd/meta", "dir for parsed SD file metadata/thumbnails (1MB cap, oldest evicted)")
 	presetsFile := flag.String("presets-file", "/etc/gonkd/presets.json", "heat presets file")
 	allowStream := flag.Bool("allow-stream", false, "allow stream-mode uploads/prints (off by default: headless fragments would run as live G-code)")
+	uploadProto := flag.String("upload-proto", "ascii", "SD upload protocol: ascii (M28/M29 lines), binary (Marlin BINARY_FILE_TRANSFER) or auto (binary, ASCII if no binary session starts)")
 	flag.Parse()
 
 	// This box has ~128MB RAM and no swap worth mentioning; a lower GC
@@ -44,6 +45,13 @@ func main() {
 	log.SetFlags(0)
 	log.SetOutput(os.Stdout)
 	log.Printf("gonkd starting: port=%s baud=%d listen=%s mode=%s", *port, *baud, *listen, *defaultMode)
+
+	if p, err := printer.ParseUploadProtocol(*uploadProto); err != nil {
+		log.Printf("gonkd: %v, using ascii", err)
+	} else {
+		printer.UploadProto = p
+	}
+	log.Printf("gonkd: SD upload protocol: %s", printer.UploadProto)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

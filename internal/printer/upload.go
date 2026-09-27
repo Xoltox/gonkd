@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -15,11 +16,27 @@ import (
 	"github.com/Xoltox/gonkd/internal/heatshrink"
 )
 
-// BinaryTransferEnabled gates the binary upload path. Off until it is
-// reworked: it never sends "M28 B1" to switch Marlin into binary mode, and
-// it reads the port directly while readLoop is also reading it (bytes get
-// split between the two, and its read deadline is left set afterwards).
-var BinaryTransferEnabled = false
+// UploadProtocol selects how UploadToSD moves a file to the card.
+type UploadProtocol string
+
+const (
+	ProtoASCII  UploadProtocol = "ascii"  // M28 <name> ... M29, numbered and checksummed lines
+	ProtoBinary UploadProtocol = "binary" // Marlin BINARY_FILE_TRANSFER ("M28 B1")
+	ProtoAuto   UploadProtocol = "auto"   // binary, ASCII if no binary session starts
+)
+
+// UploadProto is the protocol UploadToSD uses; set once at startup
+// (-upload-proto). ASCII until binary is verified on the printer.
+var UploadProto = ProtoASCII
+
+// ParseUploadProtocol validates an -upload-proto value.
+func ParseUploadProtocol(s string) (UploadProtocol, error) {
+	switch p := UploadProtocol(strings.ToLower(strings.TrimSpace(s))); p {
+	case ProtoASCII, ProtoBinary, ProtoAuto:
+		return p, nil
+	}
+	return "", fmt.Errorf("unknown upload protocol %q (want ascii, binary or auto)", s)
+}
 
 // ProgressFunc is called periodically during upload/stream with 0..100.
 type ProgressFunc func(sentBytes, totalBytes int64)
@@ -72,24 +89,33 @@ func (d *Driver) UploadToSD(ctx context.Context, localPath, longName string, nam
 	}
 	short := d.assignShort(names, longName)
 
-	if BinaryTransferEnabled {
-		err = d.uploadBinary(ctx, localPath, short, size, progress)
-		if err != nil {
-			// Binary sync/transfer failed (protocol mismatch, timeout, nack):
-			// fall back to the always-supported ASCII M28/M29 path.
-			if err2 := d.uploadASCII(ctx, gen, localPath, short, size, progress); err2 != nil {
-				err = fmt.Errorf("binary transfer failed (%v), ASCII fallback also failed: %w", err, err2)
-			} else {
-				err = nil
-			}
+	start := time.Now()
+	used, detail := ProtoASCII, ""
+	if UploadProto == ProtoBinary || UploadProto == ProtoAuto {
+		used = ProtoBinary
+		var st binStats
+		st, err = d.uploadBinary(ctx, gen, localPath, short, progress)
+		detail = fmt.Sprintf(", %d bytes on the wire, %d resends", st.Wire, st.Resends)
+		if st.Compressed {
+			detail += ", heatshrink"
+		}
+		if err != nil && UploadProto == ProtoAuto && st.CanFallBack && ctx.Err() == nil && d.gen.Load() == gen {
+			log.Printf("gonkd: upload %s: binary transfer did not start (%v), using ASCII", short, err)
+			used, detail = ProtoASCII, ""
+			start = time.Now()
+			err = d.uploadASCII(ctx, gen, localPath, short, size, progress)
 		}
 	} else {
 		err = d.uploadASCII(ctx, gen, localPath, short, size, progress)
 	}
 	if err != nil {
+		log.Printf("gonkd: upload %s via %s failed after %.1fs: %v", short, used, time.Since(start).Seconds(), err)
 		names.Forget(short)
 		return "", err
 	}
+	dur := time.Since(start)
+	log.Printf("gonkd: upload %s via %s: %d bytes in %.1fs, %.1f KB/s%s",
+		short, used, size, dur.Seconds(), float64(size)/1000/max(dur.Seconds(), 0.001), detail)
 	return short, nil
 }
 
@@ -325,62 +351,255 @@ func firstField(s string) string {
 	return s
 }
 
-// uploadBinary drives internal/binprotocol directly over the raw
-// connection. Unused while BinaryTransferEnabled is false; it still reads
-// the port concurrently with readLoop, which must be solved (readLoop as
-// the only reader) before it can be enabled.
-func (d *Driver) uploadBinary(ctx context.Context, localPath, short string, size int64, progress ProgressFunc) error {
-	client := binprotocol.NewClient(d.conn)
-	client.Timeout = 3 * time.Second
+// Binary transfer tuning; variables so tests can shorten them.
+var (
+	binTimeout     = time.Second      // reply timeout before a resend (reference client: 1 s)
+	binOpenTimeout = 10 * time.Second // OPEN/CLOSE answer: Marlin mounts the card, creates or flushes the file
+	binSwitchWait  = 5 * time.Second  // ok for "M28 B1" after "Switching to Binary Protocol"
+	binWindow      = 4                // WRITE packets in flight: 4 x 106 bytes, far below RX_BUFFER_SIZE 2048
+	binCompress    = true             // heatshrink when Marlin offers it
+)
 
-	caps, err := client.Sync()
+// binStats describes a binary upload for the summary log line.
+type binStats struct {
+	Wire        int64
+	Resends     int
+	Compressed  bool
+	CanFallBack bool // failed before any file was created, printer back in ASCII mode
+}
+
+// uploadBinary sends the file with Marlin's BINARY_FILE_TRANSFER protocol
+// (internal/binprotocol). The card gets the same bytes as with ASCII:
+// every line comment-stripped and filtered exactly like uploadASCII, each
+// ended by "\n", and metaFeed still sees every raw line.
+//
+// Sequence: all ASCII acked; "M28 B1" and its ok; readLoop hands replies
+// to the session and the pump stays silent (enterBinary); SYNC, QUERY,
+// OPEN, WRITE..., CLOSE, CONTROL CLOSE; a bare newline and the pump
+// resumes (leaveBinary). Any failure after OPEN sends ABORT (the partial
+// file is deleted) and CONTROL CLOSE, so Marlin is left in ASCII mode with
+// no file open; if even that gets no answer, Marlin's own 10 s transfer
+// timeout closes and deletes the file.
+func (d *Driver) uploadBinary(ctx context.Context, gen uint64, localPath, short string, progress ProgressFunc) (st binStats, err error) {
+	st.CanFallBack = true
+	if !d.Capabilities()["BINARY_FILE_TRANSFER"] {
+		return st, errors.New("printer does not report Cap:BINARY_FILE_TRANSFER")
+	}
+	f, err := os.Open(localPath)
 	if err != nil {
-		return fmt.Errorf("sync: %w", err)
+		return st, err
 	}
-
-	data, err := os.ReadFile(localPath)
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
-		return err
+		return st, err
 	}
-	compressed := heatshrink.Encode(data, heatshrink.DefaultConfig())
+	size := info.Size()
 
-	if err := client.Open(short, uint32(size), true); err != nil {
-		return fmt.Errorf("open: %w", err)
+	// Nothing ASCII may be in flight: after M28 B1 Marlin reads packets.
+	if err := d.waitFor(ctx, gen, m28Timeout, d.drained); err != nil {
+		return st, err
+	}
+	d.binSwitched.Store(false)
+	d.m28.Store(m28Waiting)
+	err = d.sendOwned(ctx, gen, "M28 B1")
+	if err == nil {
+		err = d.waitFor(ctx, gen, m28Timeout, func() bool {
+			return d.binSwitched.Load() || d.m28.Load() != m28Waiting || d.drained()
+		})
+	}
+	opened := d.m28.Swap(m28Idle) == m28Opened
+	switch {
+	case err != nil && !d.binSwitched.Load():
+		return st, fmt.Errorf("M28 B1: %w", err)
+	case opened:
+		// A firmware without binary transfer takes "B1" as a file name
+		// and is now saving; close and delete it.
+		d.abortUpload(gen, "B1")
+		return st, errors.New("printer opened a file for M28 B1 instead of switching to binary mode")
+	case !d.binSwitched.Load():
+		return st, errors.New("printer did not switch to binary mode")
+	}
+	// "Switching" comes before the ok; let the ok arrive so the ASCII
+	// window is empty. If it was lost, the stall replay settles it once
+	// the port is back in ASCII mode (Marlin has the line already).
+	_ = d.waitFor(ctx, gen, binSwitchWait, d.drained)
+
+	// From here on Marlin reads packets: every exit path must get it back
+	// to ASCII (Exit) before leaveBinary lets the pump write again.
+	st.CanFallBack = false
+	if err := d.enterBinary(gen); err != nil {
+		return st, err
+	}
+	defer d.leaveBinary(gen)
+	sctx, cancel := d.linkCtx(ctx, 0)
+	defer cancel()
+
+	var sess *binprotocol.Session
+	exit := func() {
+		if sess == nil || d.gen.Load() != gen {
+			return
+		}
+		ectx, cancel := d.linkCtx(context.Background(), closeTimeout)
+		defer cancel()
+		if err := sess.Exit(ectx); err != nil {
+			log.Printf("gonkd: binary transfer: leaving binary mode: %v (the printer may still be in binary mode)", err)
+		}
+	}
+	defer func() {
+		if sess != nil {
+			s := sess.Stats()
+			st.Wire, st.Resends = s.Wire, s.Resends
+		}
+	}()
+
+	// Not cancelled by ctx: once Marlin has switched, only a synced session
+	// can bring it back to ASCII (Start is bounded by its own timeouts).
+	startCtx, startCancel := d.linkCtx(context.Background(), 0)
+	defer startCancel()
+	sess, err = binprotocol.Start(startCtx, binprotocol.Config{
+		Write:       func(p []byte) error { return d.writeBinary(gen, p) },
+		Lines:       d.binLines,
+		Timeout:     binTimeout,
+		OpenTimeout: binOpenTimeout,
+		Window:      binWindow,
+	})
+	if err != nil {
+		// Without an "ss" the stream sync is unknown and no CONTROL
+		// CLOSE can be addressed: no fallback, the printer may still be
+		// in binary mode.
+		if sess != nil {
+			exit()
+			st.CanFallBack = d.gen.Load() == gen
+		}
+		return st, fmt.Errorf("binary session: %w", err)
 	}
 
-	chunk := binprotocol.MaxChunk(caps)
-	sent := 0
-	for sent < len(compressed) {
-		select {
-		case <-ctx.Done():
-			_ = client.Abort()
-			return ctx.Err()
-		default:
-		}
-		end := sent + chunk
-		if end > len(compressed) {
-			end = len(compressed)
-		}
-		if err := client.Write(compressed[sent:end]); err != nil {
-			_ = client.Abort()
-			return fmt.Errorf("write: %w", err)
-		}
-		sent = end
-		if progress != nil {
-			// Report progress in terms of the (larger) uncompressed size so
-			// the UI's percentage tracks the actual file, not the wire
-			// bytes, using compression ratio as an estimate.
-			ratio := float64(sent) / float64(len(compressed))
-			progress(int64(ratio*float64(size)), size)
+	var enc *heatshrink.Encoder
+	pw := &packetWriter{ctx: sctx, s: sess}
+	var sink io.Writer = pw
+	if w, l, ok := sess.Heatshrink(); ok && binCompress {
+		if e, err := heatshrink.NewEncoder(pw, heatshrink.Config{WindowBits: uint(w), LookaheadBits: uint(l)}); err == nil {
+			enc, sink = e, e
+			st.Compressed = true
+		} else {
+			log.Printf("gonkd: binary transfer: %v, sending uncompressed", err)
 		}
 	}
-	if err := client.Close(); err != nil {
-		return fmt.Errorf("close: %w", err)
+	if ctx.Err() != nil {
+		exit()
+		return st, ctx.Err()
 	}
+	if err := sess.Open(sctx, short, enc != nil); err != nil {
+		// If OPEN was processed but its answer lost, the file is open and
+		// Marlin is saving: after CONTROL CLOSE every ASCII line would be
+		// written into it (queue.cpp, card.flag.saving). CLOSE ends that and
+		// is harmless otherwise ("PFT:invalid"); ABORT is not (it deletes
+		// card.filename, which may be another file).
+		if d.gen.Load() == gen {
+			cctx, cancel := d.linkCtx(context.Background(), closeTimeout)
+			_ = sess.Close(cctx)
+			cancel()
+		}
+		exit()
+		st.CanFallBack = d.gen.Load() == gen
+		return st, err
+	}
+
+	fail := func(err error) (binStats, error) {
+		if d.gen.Load() == gen {
+			actx, cancel := d.linkCtx(context.Background(), closeTimeout)
+			if aerr := sess.Abort(actx); aerr != nil {
+				log.Printf("gonkd: binary transfer: abort: %v", aerr)
+			}
+			cancel()
+			exit()
+		}
+		if ctx.Err() != nil {
+			return st, ctx.Err()
+		}
+		return st, err
+	}
+
+	var sent, reported int64
+	lineNo := 0
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 4096), uploadMaxLine)
+	for scanner.Scan() {
+		if err := sctx.Err(); err != nil {
+			return fail(err)
+		}
+		line := scanner.Text()
+		lineNo++
+		sent += int64(len(line)) + 1
+		if d.metaFeed != nil {
+			d.metaFeed(line)
+		}
+		cmd := stripComment(line)
+		if cmd == "" || isSaveControl(cmd) || hasM110(cmd) {
+			continue
+		}
+		if len(cmd) > gcode.MaxFramedLen {
+			// Marlin would cut it short when printing from the card.
+			return fail(fmt.Errorf("G-code line %d is too long for the printer: %d bytes after comment removal, Marlin keeps %d",
+				lineNo, len(cmd), gcode.MaxFramedLen))
+		}
+		if _, err := io.WriteString(sink, cmd+"\n"); err != nil {
+			return fail(err)
+		}
+		if progress != nil && sent-reported >= 4096 {
+			reported = sent
+			progress(sent, size)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fail(fmt.Errorf("read %s: %w", localPath, err))
+	}
+	if enc != nil {
+		if err := enc.Close(); err != nil {
+			return fail(err)
+		}
+	}
+	if err := pw.flush(); err != nil {
+		return fail(err)
+	}
+	if err := sess.Close(sctx); err != nil {
+		return fail(err)
+	}
+	exit()
 	if progress != nil {
 		progress(size, size)
 	}
-	return nil
+	return st, nil
+}
+
+// packetWriter cuts a byte stream into WRITE packets of the session's
+// maximum payload.
+type packetWriter struct {
+	ctx context.Context
+	s   *binprotocol.Session
+	buf []byte
+}
+
+func (p *packetWriter) Write(b []byte) (int, error) {
+	p.buf = append(p.buf, b...)
+	max := p.s.MaxPayload()
+	if k := len(p.buf) / max * max; k > 0 {
+		if err := p.s.Write(p.ctx, p.buf[:k]); err != nil {
+			return 0, err
+		}
+		p.buf = append(p.buf[:0], p.buf[k:]...)
+	}
+	return len(b), nil
+}
+
+func (p *packetWriter) flush() error {
+	if len(p.buf) == 0 {
+		return nil
+	}
+	err := p.s.Write(p.ctx, p.buf)
+	p.buf = p.buf[:0]
+	return err
 }
 
 // stripComment prepares one source line for the wire so that Marlin stores

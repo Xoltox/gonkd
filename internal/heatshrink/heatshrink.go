@@ -1,185 +1,234 @@
-// Package heatshrink implements a small pure-Go encoder (and a decoder used
-// only by tests) for the heatshrink compression format used by Marlin's
-// BINARY_FILE_TRANSFER feature (src/feature/binary_stream.h wraps a
-// heatshrink_encoder/decoder pair from https://github.com/atomicobject/heatshrink).
+// Package heatshrink is a streaming encoder (and a decoder for tests) for
+// the heatshrink LZSS format that Marlin's BINARY_FILE_TRANSFER decodes
+// (Marlin/src/libs/heatshrink/heatshrink_decoder.cpp, built static with
+// HEATSHRINK_STATIC_WINDOW_BITS 8 and LOOKAHEAD_BITS 4 in
+// heatshrink_config.h; Marlin reports both in its "PFT:version" reply, so
+// callers should take them from there).
 //
-// Wire format (bit-packed, MSB-first within each byte):
+// Bit stream, MSB first within each byte:
 //
-//	tag bit: 1 = literal byte follows (8 bits), 0 = backreference follows
-//	backreference: window_bits bits of (offset-1), then lookahead_bits bits
-//	               of (length-1)
+//	1, 8 bits              literal byte
+//	0, window bits, look bits   backreference: (offset-1), (count-1)
 //
-// NOTE: the window/lookahead sizes here (8/4, heatshrink's common embedded
-// defaults) are an assumption -- Marlin's exact HEATSHRINK_STATIC_* build
-// configuration was not verified against real device firmware output as
-// part of this work. If the real printer fails to decode uploaded files,
-// this is the first thing to check (see README "Known gaps").
+// The decoder copies a backreference byte by byte through its 2^window
+// byte history (decoder.cpp st_yield_backref), so count may exceed offset.
+// The last byte is padded with zero bits, which the decoder never turns
+// into output (a backreference needs more bits than the padding holds).
 package heatshrink
 
-const (
-	DefaultWindowBits    = 8
-	DefaultLookaheadBits = 4
+import (
+	"fmt"
+	"io"
 )
 
-// Config holds the two heatshrink parameters that must match on both ends.
+// Config holds the two parameters that must match the decoder.
 type Config struct {
-	WindowBits    uint // e.g. 8 => 256-byte window
-	LookaheadBits uint // e.g. 4 => matches up to 16 bytes
+	WindowBits    uint // history 2^WindowBits bytes
+	LookaheadBits uint // longest match 2^LookaheadBits bytes
 }
 
-// DefaultConfig returns heatshrink's common embedded-target configuration.
-func DefaultConfig() Config {
-	return Config{WindowBits: DefaultWindowBits, LookaheadBits: DefaultLookaheadBits}
-}
+// Marlin 2.1.2.7's static configuration (heatshrink_config.h:17-19).
+func DefaultConfig() Config { return Config{WindowBits: 8, LookaheadBits: 4} }
 
-type bitWriter struct {
-	out     []byte
-	cur     byte
-	nbits   uint
-}
-
-func (b *bitWriter) writeBit(bit uint8) {
-	b.cur = (b.cur << 1) | (bit & 1)
-	b.nbits++
-	if b.nbits == 8 {
-		b.out = append(b.out, b.cur)
-		b.cur = 0
-		b.nbits = 0
+// Validate applies heatshrink's own limits (decoder.cpp heatshrink_decoder_alloc).
+func (c Config) Validate() error {
+	if c.WindowBits < 4 || c.WindowBits > 15 || c.LookaheadBits < 3 || c.LookaheadBits >= c.WindowBits {
+		return fmt.Errorf("heatshrink: unsupported window %d, lookahead %d", c.WindowBits, c.LookaheadBits)
 	}
+	return nil
 }
 
-func (b *bitWriter) writeBits(v uint32, n uint) {
-	for i := int(n) - 1; i >= 0; i-- {
-		b.writeBit(uint8((v >> uint(i)) & 1))
+// minMatch: a backreference costs 1+window+lookahead bits, a literal 9, so
+// with 8/4 a 2-byte match (13 bits) already beats two literals (18).
+func (c Config) minMatch() int { return int(1+c.WindowBits+c.LookaheadBits)/9 + 1 }
+
+// Encoder compresses everything written to it into w. Close flushes the
+// final bits. Memory is a few times the window size regardless of input.
+type Encoder struct {
+	cfg    Config
+	w      io.Writer
+	window int
+	maxLen int
+	buf    []byte // history (up to window bytes) followed by pending input
+	pos    int    // first pending byte in buf
+
+	out   []byte
+	cur   byte
+	nbits uint
+	in    int64 // bytes consumed
+}
+
+// NewEncoder returns an encoder writing to w. cfg must Validate.
+func NewEncoder(w io.Writer, cfg Config) (*Encoder, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
+	return &Encoder{
+		cfg:    cfg,
+		w:      w,
+		window: 1 << cfg.WindowBits,
+		maxLen: 1 << cfg.LookaheadBits,
+	}, nil
 }
 
-func (b *bitWriter) flush() []byte {
-	if b.nbits > 0 {
-		b.cur <<= (8 - b.nbits)
-		b.out = append(b.out, b.cur)
-		b.cur = 0
-		b.nbits = 0
-	}
-	return b.out
-}
-
-// Encode compresses src using the heatshrink LZSS-style format described
-// above. The match finder is a simple brute-force search over the window
-// (fine given the small 256-byte window this format uses).
-func Encode(src []byte, cfg Config) []byte {
-	window := 1 << cfg.WindowBits
-	maxLen := (1 << cfg.LookaheadBits) + minMatchExtra(cfg)
-	minMatch := 2 // shortest backref worth encoding: 1(tag)+winBits+lookBits vs 1(tag)+8 per literal
-
-	bw := &bitWriter{}
-	i := 0
-	for i < len(src) {
-		bestLen, bestOff := 0, 0
-		start := i - window
-		if start < 0 {
-			start = 0
-		}
-		limit := len(src) - i
-		if limit > maxLen {
-			limit = maxLen
-		}
-		for j := start; j < i; j++ {
-			l := 0
-			for l < limit && src[j+l] == src[i+l] {
-				l++
-			}
-			if l > bestLen {
-				bestLen = l
-				bestOff = i - j
-			}
-		}
-		if bestLen >= minMatch {
-			bw.writeBit(0)
-			bw.writeBits(uint32(bestOff-1), cfg.WindowBits)
-			bw.writeBits(uint32(bestLen-1), cfg.LookaheadBits)
-			i += bestLen
-		} else {
-			bw.writeBit(1)
-			bw.writeBits(uint32(src[i]), 8)
-			i++
+// Write encodes p, holding back the last maxLen bytes until more input (or
+// Close) shows how far a match can run.
+func (e *Encoder) Write(p []byte) (int, error) {
+	e.buf = append(e.buf, p...)
+	e.in += int64(len(p))
+	e.encode(false)
+	if len(e.out) >= 512 {
+		if err := e.emit(); err != nil {
+			return 0, err
 		}
 	}
-	return bw.flush()
+	return len(p), nil
 }
 
-func minMatchExtra(cfg Config) int { return 0 }
-
-type bitReader struct {
-	in    []byte
-	pos   int // byte index
-	bit   uint
-}
-
-func (r *bitReader) readBit() (uint8, bool) {
-	if r.pos >= len(r.in) {
-		return 0, false
+// Close encodes the remaining input, pads the last byte and writes it all.
+func (e *Encoder) Close() error {
+	e.encode(true)
+	if e.nbits > 0 {
+		e.out = append(e.out, e.cur<<(8-e.nbits))
+		e.cur, e.nbits = 0, 0
 	}
-	b := (r.in[r.pos] >> (7 - r.bit)) & 1
-	r.bit++
-	if r.bit == 8 {
-		r.bit = 0
-		r.pos++
-	}
-	return b, true
+	return e.emit()
 }
 
-func (r *bitReader) readBits(n uint) (uint32, bool) {
-	var v uint32
-	for i := uint(0); i < n; i++ {
-		b, ok := r.readBit()
-		if !ok {
-			return 0, false
-		}
-		v = (v << 1) | uint32(b)
+// Consumed returns the number of input bytes written so far.
+func (e *Encoder) Consumed() int64 { return e.in }
+
+func (e *Encoder) emit() error {
+	if len(e.out) == 0 {
+		return nil
 	}
-	return v, true
+	_, err := e.w.Write(e.out)
+	e.out = e.out[:0]
+	return err
 }
 
-// Decode reverses Encode. It exists so the encoder can be verified by
-// round-trip in tests; Marlin's own heatshrink_decoder is the real
-// consumer on the device.
-func Decode(compressed []byte, cfg Config, outSizeHint int) []byte {
-	r := &bitReader{in: compressed}
-	out := make([]byte, 0, outSizeHint)
-	for outSizeHint <= 0 || len(out) < outSizeHint {
-		tag, ok := r.readBit()
-		if !ok {
+func (e *Encoder) encode(final bool) {
+	minLen := e.cfg.minMatch()
+	for {
+		avail := len(e.buf) - e.pos
+		if avail == 0 || (!final && avail < e.maxLen) {
 			break
 		}
-		if tag == 1 {
-			v, ok := r.readBits(8)
-			if !ok {
-				break
+		limit := min(avail, e.maxLen)
+		bestLen, bestOff := 0, 0
+		cur := e.buf[e.pos:]
+		for j := max(0, e.pos-e.window); j < e.pos; j++ {
+			if e.buf[j] != cur[0] {
+				continue
 			}
-			out = append(out, byte(v))
-		} else {
-			off, ok := r.readBits(cfg.WindowBits)
-			if !ok {
-				break
+			l := 1
+			for l < limit && e.buf[j+l] == cur[l] {
+				l++
 			}
-			ln, ok := r.readBits(cfg.LookaheadBits)
-			if !ok {
-				break
-			}
-			offset := int(off) + 1
-			length := int(ln) + 1
-			start := len(out) - offset
-			if start < 0 {
-				break
-			}
-			for k := 0; k < length; k++ {
-				out = append(out, out[start+k])
+			// >= prefers the nearest of equally long matches.
+			if l >= bestLen {
+				bestLen, bestOff = l, e.pos-j
 			}
 		}
+		if bestLen >= minLen {
+			e.bits(0, 1)
+			e.bits(uint32(bestOff-1), e.cfg.WindowBits)
+			e.bits(uint32(bestLen-1), e.cfg.LookaheadBits)
+			e.pos += bestLen
+		} else {
+			e.bits(1, 1)
+			e.bits(uint32(cur[0]), 8)
+			e.pos++
+		}
 	}
-	if outSizeHint > 0 && len(out) > outSizeHint {
-		out = out[:outSizeHint]
+	// Keep only the history the window can still reach.
+	if drop := e.pos - e.window; drop >= 4096 {
+		n := copy(e.buf, e.buf[drop:])
+		e.buf = e.buf[:n]
+		e.pos -= drop
 	}
-	return out
+}
+
+func (e *Encoder) bits(v uint32, n uint) {
+	for i := int(n) - 1; i >= 0; i-- {
+		e.cur = e.cur<<1 | byte(v>>uint(i)&1)
+		if e.nbits++; e.nbits == 8 {
+			e.out = append(e.out, e.cur)
+			e.cur, e.nbits = 0, 0
+		}
+	}
+}
+
+// Encode compresses src in one go.
+func Encode(src []byte, cfg Config) ([]byte, error) {
+	var out sliceWriter
+	enc, err := NewEncoder(&out, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := enc.Write(src); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return out.b, nil
+}
+
+type sliceWriter struct{ b []byte }
+
+func (s *sliceWriter) Write(p []byte) (int, error) {
+	s.b = append(s.b, p...)
+	return len(p), nil
+}
+
+// Decode reverses Encode the way Marlin's decoder does: a history of
+// 2^WindowBits bytes that starts zeroed (heatshrink_decoder_reset), trailing
+// bits that do not make a whole literal or backreference are ignored.
+func Decode(src []byte, cfg Config) []byte {
+	win := make([]byte, 1<<cfg.WindowBits)
+	mask := len(win) - 1
+	head := 0
+	var out []byte
+	pos, bit := 0, uint(0)
+	read := func(n uint) (uint32, bool) {
+		var v uint32
+		for i := uint(0); i < n; i++ {
+			if pos >= len(src) {
+				return 0, false
+			}
+			v = v<<1 | uint32(src[pos]>>(7-bit)&1)
+			if bit++; bit == 8 {
+				bit, pos = 0, pos+1
+			}
+		}
+		return v, true
+	}
+	push := func(c byte) {
+		win[head&mask] = c
+		head++
+		out = append(out, c)
+	}
+	for {
+		tag, ok := read(1)
+		if !ok {
+			return out
+		}
+		if tag == 1 {
+			c, ok := read(8)
+			if !ok {
+				return out
+			}
+			push(byte(c))
+			continue
+		}
+		idx, ok1 := read(cfg.WindowBits)
+		cnt, ok2 := read(cfg.LookaheadBits)
+		if !ok1 || !ok2 {
+			return out
+		}
+		for i := 0; i <= int(cnt); i++ {
+			push(win[(head-int(idx)-1)&mask])
+		}
+	}
 }
