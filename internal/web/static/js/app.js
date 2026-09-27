@@ -5,10 +5,11 @@ import { mountUserWait } from './userwait.js';
 import * as now from './screens/now.js';
 import * as files from './screens/files.js';
 import * as control from './screens/control.js';
+import * as bed from './screens/bed.js';
 import * as consoleScreen from './screens/console.js';
 import * as settings from './screens/settings.js';
 
-const SCREENS = { now, files, control, console: consoleScreen, settings };
+const SCREENS = { now, files, control, bed, console: consoleScreen, settings };
 const TITLES = Object.fromEntries(ROUTES.map(([id, label]) => [id, label]));
 
 const main = document.getElementById('main');

@@ -95,6 +95,18 @@ type UserWait struct {
 	Message string    `json:"message"`
 }
 
+// Leveling describes an in-progress manual mesh probe (G29 S1/S2), reported
+// in Snapshot while active so any client watching /gonkd/status sees the
+// wizard's progress, not just the one that started it. Point/Total come
+// straight from Marlin's own "MBL G29 point N of TOTAL" line (mbl/G29.cpp),
+// so they always match what the firmware thinks, including on a firmware
+// rebuild with a different GRID_MAX_POINTS.
+type Leveling struct {
+	Point int     `json:"point"`
+	Total int     `json:"total"`
+	Z     float64 `json:"z"`
+}
+
 // Snapshot is the full point-in-time state returned by the JSON API.
 type Snapshot struct {
 	Version      string    `json:"version"`
@@ -108,4 +120,19 @@ type Snapshot struct {
 	Tune         Tune      `json:"tune"`
 	Limits       Limits    `json:"limits"`
 	UserWait     *UserWait `json:"userWait,omitempty"`
+	Leveling     *Leveling `json:"leveling,omitempty"`
+}
+
+// Mesh is the parsed reply to "G29 S0" (mbl/G29.cpp MeshReport case): the
+// mesh either has no data yet (Active false, Points nil, before the first
+// full G29 S1/S2 cycle finishes) or is a complete GRID_MAX_POINTS_X x
+// GRID_MAX_POINTS_Y grid. Points is row-major, Points[y][x], matching the
+// order Marlin's print_2d_array (bedlevel.cpp) prints it in.
+type Mesh struct {
+	Active  bool        `json:"active"`
+	ZOffset float64     `json:"zOffset"`
+	Points  [][]float64 `json:"points,omitempty"`
+	Min     float64     `json:"min,omitempty"`
+	Max     float64     `json:"max,omitempty"`
+	Range   float64     `json:"range,omitempty"`
 }

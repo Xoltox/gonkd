@@ -29,6 +29,30 @@ let files = [
   { short: 'TEST.GCO', long: '', bytes: 4096 },
 ];
 let presets = [{ name: 'PLA', hotend: 200, bed: 60 }, { name: 'PETG', hotend: 235, bed: 80 }];
+
+// ---- mesh / bed leveling ----
+const GRID = 5;
+let mesh = { active: false, zOffset: 0, points: null };
+let leveling = null; // {point,total,z}
+function meshMinMaxRange() {
+  if (!mesh.points) return { min: 0, max: 0, range: 0 };
+  const flat = mesh.points.flat();
+  const min = Math.min(...flat), max = Math.max(...flat);
+  return { min, max, range: max - min };
+}
+function meshView() {
+  if (!mesh.points) return { active: false, zOffset: mesh.zOffset };
+  return { active: mesh.active, zOffset: mesh.zOffset, points: mesh.points, ...meshMinMaxRange() };
+}
+function randomMesh() {
+  const pts = [];
+  for (let y = 0; y < GRID; y++) {
+    const row = [];
+    for (let x = 0; x < GRID; x++) row.push(Math.round((Math.sin(x / 2) * 0.05 + Math.cos(y / 2) * 0.05 + (Math.random() - 0.5) * 0.02) * 1000) / 1000);
+    pts.push(row);
+  }
+  return pts;
+}
 const p = {
   state: 'idle', connected: true,
   temps: { HotendActual: 24.1, HotendTarget: 0, BedActual: 23.4, BedTarget: 0, FanPercent: 0 },
@@ -41,7 +65,7 @@ let uploadFail = false;
 let upload = null; // {file, sent, total, print}
 
 const clients = new Set();
-const snapshot = () => ({ ...p, job: p.job ? { ...p.job } : undefined });
+const snapshot = () => ({ ...p, job: p.job ? { ...p.job } : undefined, leveling: leveling ? { ...leveling } : undefined });
 function emit(event, data) {
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) res.write(msg);
@@ -175,6 +199,7 @@ async function api(req, res, url) {
     res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'max-age=86400' });
     return res.end(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="#2a2621"/><path d="M14 44h36l-6-16H22z" fill="hsl(${hue} 70% 55%)"/><rect x="26" y="18" width="12" height="10" fill="hsl(${hue} 70% 45%)"/></svg>`);
   }
+  if (path === '/gonkd/mesh' && req.method === 'GET') return json(res, 200, meshView());
   if (path === '/gonkd/presets' && req.method === 'GET') return json(res, 200, presets);
   if (path === '/gonkd/presets' && req.method === 'PUT') {
     const list = j();
@@ -253,6 +278,62 @@ async function api(req, res, url) {
       if (b.fan != null && (b.fan < 0 || b.fan > 100)) return fail(res, 400, 'fan out of range');
       setTimeout(() => Object.assign(p.tune, b), 400); // confirm a bit later: shows pending state
       if (b.fan != null) p.temps.FanPercent = b.fan;
+      return done(res);
+    }
+    case '/gonkd/mesh/level': {
+      if (busy()) return fail(res, 409, 'a job is already active');
+      const { action, save } = j();
+      if (action === 'start') {
+        leveling = { point: 1, total: GRID * GRID, z: 0.2 };
+        say('MBL G29 point 1 of 25');
+        return json(res, 200, leveling);
+      }
+      if (action === 'next') {
+        if (!leveling) return fail(res, 409, 'not levelling');
+        if (leveling.point >= leveling.total) {
+          mesh = { active: true, zOffset: mesh.zOffset, points: randomMesh() };
+          leveling = null;
+          say('Mesh probing done.');
+          return json(res, 200, { point: GRID * GRID, total: GRID * GRID, z: 5, done: true });
+        }
+        leveling.point += 1;
+        leveling.z = 0.2 + Math.round((Math.random() - 0.5) * 40) / 1000;
+        say(`MBL G29 point ${leveling.point} of ${leveling.total}`);
+        return json(res, 200, { ...leveling, done: false });
+      }
+      if (action === 'abort') { leveling = null; say('M211 S1'); return done(res); }
+      if (action === 'finish') {
+        if (!save) { mesh = { active: false, zOffset: 0, points: null }; say('G29 S5'); }
+        else say('M420 S1');
+        return done(res);
+      }
+      return fail(res, 400, 'bad action');
+    }
+    case '/gonkd/mesh/zadjust': {
+      if (busy()) return fail(res, 409, 'a job is already active');
+      if (!leveling) return fail(res, 400, 'not levelling');
+      const mm = Math.max(-1, Math.min(1, j().mm || 0));
+      leveling.z += mm;
+      return json(res, 200, { z: leveling.z });
+    }
+    case '/gonkd/mesh/zoffset': {
+      if (busy()) return fail(res, 409, 'a job is already active');
+      const b = j();
+      mesh.zOffset = Math.max(-2, Math.min(2, b.z || 0));
+      if (b.save) say('M500');
+      return done(res);
+    }
+    case '/gonkd/mesh/point': {
+      if (busy()) return fail(res, 409, 'a job is already active');
+      const b = j();
+      if (!mesh.points || b.x < 0 || b.x >= GRID || b.y < 0 || b.y >= GRID) return fail(res, 400, 'bad point');
+      mesh.points[b.y][b.x] = b.z;
+      if (b.save) say('M500');
+      return done(res);
+    }
+    case '/gonkd/bed/corner': {
+      if (busy()) return fail(res, 409, 'a job is already active');
+      if (!['fl', 'fr', 'bl', 'br', 'center'].includes(j().corner)) return fail(res, 400, 'bad corner');
       return done(res);
     }
     case '/api/files/local': {

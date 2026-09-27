@@ -95,6 +95,10 @@ type Manager struct {
 	lastBusyAt    time.Time // last busy/prompt line seen, for the userWaitClear timeout
 	userWaitBytes int64     // SD byte progress when userWait was set; a later advance clears it
 	consoleSeen   int64     // ConsoleSince cursor for scanUserWait
+
+	// leveling is non-nil while a manual mesh probe (G29 S1/S2) is under
+	// way; see mesh.go.
+	leveling *Leveling
 }
 
 func NewManager(names *NameMap) *Manager {
@@ -217,6 +221,11 @@ func (m *Manager) Snapshot() Snapshot {
 		uw := *m.userWait
 		userWait = &uw
 	}
+	var leveling *Leveling
+	if m.leveling != nil {
+		lv := *m.leveling
+		leveling = &lv
+	}
 	m.mu.Unlock()
 
 	if job != nil {
@@ -234,6 +243,7 @@ func (m *Manager) Snapshot() Snapshot {
 		Tune:      Tune{Speed: speed, Flow: flow, Fan: fan},
 		Limits:    Limits{HotendMax: hotendMaxC, BedMax: bedMaxC},
 		UserWait:  userWait,
+		Leveling:  leveling,
 	}
 	if drv != nil {
 		snap.Temps = drv.Temps()

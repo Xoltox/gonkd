@@ -9,6 +9,7 @@ export const ROUTES = [
   ['now', 'Now', 'now'],
   ['files', 'Files', 'files'],
   ['control', 'Control', 'control'],
+  ['bed', 'Bed', 'layers'],
   ['console', 'Console', 'console'],
   ['settings', 'Settings', 'settings'],
 ];

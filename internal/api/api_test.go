@@ -362,3 +362,91 @@ func TestJobContinueRejectsGET(t *testing.T) {
 		t.Fatalf("status = %d, want 405", rec.Code)
 	}
 }
+
+// --- Bed / mesh routes ---
+
+func TestMeshGetDisconnectedConflict(t *testing.T) {
+	mux := newRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/gonkd/mesh", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMeshGetRejectsPOST(t *testing.T) {
+	mux := newRouter(t)
+	req := httptest.NewRequest(http.MethodPost, "http://192.0.2.10/gonkd/mesh", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestMeshLevelActionValidation(t *testing.T) {
+	mux := newRouter(t)
+	rec := postJSON(t, mux, "/gonkd/mesh/level", `{"action":"sideways"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad action: status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	// A recognized action past validation, disconnected: 409, not 400.
+	for _, action := range []string{"start", "next", "abort", "finish"} {
+		rec := postJSON(t, mux, "/gonkd/mesh/level", `{"action":"`+action+`"}`)
+		if rec.Code != http.StatusConflict {
+			t.Errorf("action %s while disconnected: status = %d, want 409; body=%s", action, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// Disconnected and with no leveling wizard in progress, MeshZAdjust
+// rejects for lack of a known Z to adjust from (ErrInvalidCommand, 400)
+// before it would otherwise hit the disconnected check.
+func TestMeshZAdjustWithoutLevelingRejected(t *testing.T) {
+	mux := newRouter(t)
+	rec := postJSON(t, mux, "/gonkd/mesh/zadjust", `{"mm":0.1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMeshZOffsetDisconnectedConflict(t *testing.T) {
+	mux := newRouter(t)
+	rec := postJSON(t, mux, "/gonkd/mesh/zoffset", `{"z":0.1,"save":true}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMeshPointValidationAndConflict(t *testing.T) {
+	mux := newRouter(t)
+	rec := postJSON(t, mux, "/gonkd/mesh/point", `{"x":0,"y":0,"z":0.02}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBedCornerValidationAndConflict(t *testing.T) {
+	mux := newRouter(t)
+	rec := postJSON(t, mux, "/gonkd/bed/corner", `{"corner":"nope"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad corner: status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	rec = postJSON(t, mux, "/gonkd/bed/corner", `{"corner":"fl"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("valid corner while disconnected: status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBedRoutesRejectGET(t *testing.T) {
+	mux := newRouter(t)
+	for _, path := range []string{"/gonkd/mesh/level", "/gonkd/mesh/zadjust", "/gonkd/mesh/zoffset", "/gonkd/mesh/point", "/gonkd/bed/corner"} {
+		req := httptest.NewRequest(http.MethodGet, "http://192.0.2.10"+path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("GET %s: status = %d, want 405", path, rec.Code)
+		}
+	}
+}

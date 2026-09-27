@@ -338,6 +338,23 @@ body:has(.has-actionbar) .toast-host { bottom: calc(var(--nav-h) + var(--bar-h) 
 .heat-row { display: flex; gap: 8px; align-items: flex-end; }
 .heat-row .btn { flex: none; }
 
+/* ---- bed ---- */
+.mesh-stats { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 10px; }
+.mesh-grid {
+  display: grid; grid-template-columns: repeat(var(--cols, 5), 1fr); gap: 4px;
+  aspect-ratio: 1; max-width: 360px; margin: 0 auto;
+}
+.mesh-cell {
+  display: flex; align-items: center; justify-content: center; border: 1px solid var(--border);
+  border-radius: 4px; font-size: .8125rem; color: var(--text-1); min-height: 0; padding: 0;
+}
+.mesh-cell:disabled { opacity: .6; }
+.wizard-z { display: flex; align-items: baseline; gap: 4px; justify-content: center; margin: 8px 0; }
+.wizard-z .num-l { font-size: 2rem; }
+.wizard-zbtn { justify-self: center; }
+.corner-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 360px; margin: 8px auto 0; }
+.corner-grid .btn { aspect-ratio: 1; height: auto; }
+
 /* ---- files ---- */
 .upload .drop { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
 .upload.is-drag { border: 2px dashed var(--bed); background: var(--bed-bg); }

@@ -64,6 +64,14 @@ export const api = {
   jog: (axis, dist, feed) => post('/gonkd/jog', { axis, dist, feed }),
   heat: (body) => post('/gonkd/heat', body),
   tune: (body) => post('/gonkd/tune', body),
+  mesh: () => getJSON('/gonkd/mesh'),
+  // start/next reply with the leveling state as JSON; abort/finish reply 204.
+  meshLevelStep: (action) => req('POST', '/gonkd/mesh/level', { action }).then((r) => r.json()),
+  meshLevelEnd: (action, save) => post('/gonkd/mesh/level', { action, save: !!save }),
+  meshZAdjust: (mm) => req('POST', '/gonkd/mesh/zadjust', { mm }).then((r) => r.json()),
+  meshZOffset: (z, save) => post('/gonkd/mesh/zoffset', { z, save: !!save }),
+  meshPoint: (x, y, z, save) => post('/gonkd/mesh/point', { x, y, z, save: !!save }),
+  bedCorner: (corner) => post('/gonkd/bed/corner', { corner }),
 };
 
 export const thumbUrl = (short) => '/gonkd/files/thumb?name=' + encodeURIComponent(short);

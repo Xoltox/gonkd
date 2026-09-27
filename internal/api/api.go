@@ -113,6 +113,12 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/gonkd/heat", s.handleHeat)
 	mux.HandleFunc("/gonkd/presets", s.handlePresets)
 	mux.HandleFunc("/gonkd/events", s.handleEvents)
+	mux.HandleFunc("/gonkd/mesh", s.handleMesh)
+	mux.HandleFunc("/gonkd/mesh/level", s.handleMeshLevel)
+	mux.HandleFunc("/gonkd/mesh/zadjust", s.handleMeshZAdjust)
+	mux.HandleFunc("/gonkd/mesh/zoffset", s.handleMeshZOffset)
+	mux.HandleFunc("/gonkd/mesh/point", s.handleMeshPoint)
+	mux.HandleFunc("/gonkd/bed/corner", s.handleBedCorner)
 }
 
 // --- CSRF / Host hardening (SEC-5, SEC-25) ---
@@ -726,6 +732,160 @@ func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleMesh implements GET /gonkd/mesh: the current mesh (G29 S0),
+// blocked (like every mesh/bed route) while a job runs.
+func (s *Server) handleMesh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	mesh, err := s.Mgr.MeshReport()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, mesh)
+}
+
+// handleMeshLevel implements POST /gonkd/mesh/level
+// {"action":"start"|"next"|"abort"|"finish","save"?}: drives the manual
+// probe wizard (G29 S1/S2), or ends it.
+func (s *Server) handleMeshLevel(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		Action string `json:"action"`
+		Save   bool   `json:"save"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	switch body.Action {
+	case "start":
+		lv, err := s.Mgr.MeshLevelStart()
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, lv)
+	case "next":
+		lv, done, err := s.Mgr.MeshLevelNext()
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, struct {
+			printer.Leveling
+			Done bool `json:"done"`
+		}{lv, done})
+	case "abort":
+		if err := s.Mgr.MeshLevelAbort(); err != nil {
+			writeErr(w, err)
+			return
+		}
+		noContent(w)
+	case "finish":
+		if err := s.Mgr.MeshLevelFinish(body.Save); err != nil {
+			writeErr(w, err)
+			return
+		}
+		noContent(w)
+	default:
+		http.Error(w, "action must be one of start, next, abort, finish", http.StatusBadRequest)
+	}
+}
+
+// handleMeshZAdjust implements POST /gonkd/mesh/zadjust {"mm":+-float}: a
+// fine Z nudge during leveling, clamped server-side (Manager.MeshZAdjust).
+func (s *Server) handleMeshZAdjust(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		MM float64 `json:"mm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	z, err := s.Mgr.MeshZAdjust(body.MM)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]float64{"z": z})
+}
+
+// handleMeshZOffset implements POST /gonkd/mesh/zoffset {"z":float,"save":bool}:
+// G29 S4, optionally M500. "Save current babystep as Z offset" is a UI
+// convenience, not a separate mode: the client computes z as the mesh's
+// current zOffset (GET /gonkd/mesh) plus the last known job babystepMm
+// (only available while a job is/was active) and posts that sum here.
+func (s *Server) handleMeshZOffset(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		Z    float64 `json:"z"`
+		Save bool    `json:"save"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.Mgr.MeshZOffset(body.Z, body.Save); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+// handleMeshPoint implements POST /gonkd/mesh/point
+// {"x":i,"y":j,"z":float,"save":bool}: G29 S3, editing one mesh cell.
+func (s *Server) handleMeshPoint(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		X    int     `json:"x"`
+		Y    int     `json:"y"`
+		Z    float64 `json:"z"`
+		Save bool    `json:"save"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.Mgr.MeshSetPoint(body.X, body.Y, body.Z, body.Save); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+// handleBedCorner implements POST /gonkd/bed/corner {"corner":"fl"|"fr"|"bl"|"br"|"center"|"done"}:
+// the corner-assistant safe move.
+func (s *Server) handleBedCorner(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, true) {
+		return
+	}
+	var body struct {
+		Corner string `json:"corner"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.Mgr.BedCorner(printer.Corner(body.Corner)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
 }
 
 func clamp(v, lo, hi float64) float64 {

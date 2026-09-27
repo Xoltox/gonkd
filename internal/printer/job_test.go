@@ -31,10 +31,20 @@ type jtFake struct {
 	openFail  bool
 	mute      bool // read but never answer
 	holdAbort bool // M524 does not produce "Not SD printing" on its own
+
+	// Minimal G29 (MESH_BED_LEVELING) simulation, enough to exercise
+	// mesh.go's parsing and flow against a Marlin-shaped reply; see
+	// mbl/G29.cpp (Marlin source) for the real state machine this mirrors.
+	meshIdx   int // mirrors mbl_probe_index; -1 = idle
+	meshValid bool
+	meshOn    bool
+	meshZOff  float64
+	meshGrid  [5][5]float64
+	posZ      float64 // last Z seen in a G0/G1, echoed back by M114
 }
 
 func newJTFake(conn net.Conn) *jtFake {
-	f := &jtFake{conn: conn, out: make(chan string, 4096), done: make(chan struct{})}
+	f := &jtFake{conn: conn, out: make(chan string, 4096), done: make(chan struct{}), meshIdx: -1}
 	go func() {
 		for {
 			select {
@@ -123,6 +133,25 @@ func (f *jtFake) run() {
 			} else {
 				f.emit("File opened: " + name + " Size: 100\nFile selected\n" + ok)
 			}
+		case strings.HasPrefix(body, "G29"):
+			f.emit(f.mesh(body, ok))
+		case strings.HasPrefix(body, "G0 ") || strings.HasPrefix(body, "G1 "):
+			for _, tok := range strings.Fields(body) {
+				if strings.HasPrefix(tok, "Z") {
+					var z float64
+					if _, err := fmt.Sscanf(tok[1:], "%f", &z); err == nil {
+						f.mu.Lock()
+						f.posZ = z
+						f.mu.Unlock()
+					}
+				}
+			}
+			f.emit(ok)
+		case strings.HasPrefix(body, "M114"):
+			f.mu.Lock()
+			z := f.posZ
+			f.mu.Unlock()
+			f.emit(fmt.Sprintf("X:0.00 Y:0.00 Z:%.2f E:0.00 Count X:0 Y:0 Z:0 E:0\n", z) + ok)
 		default:
 			f.emit(ok)
 		}
@@ -143,6 +172,101 @@ func jtSplit(line string) (body string, n int64, hasN bool) {
 		}
 	}
 	return strings.TrimSpace(body), n, hasN
+}
+
+// mesh answers a G29 line, mirroring mbl/G29.cpp's S0-S5 cases closely
+// enough for mesh.go's parsing and flow (real field/point values, not
+// exact G-code numbering semantics). Exactly one "ok" (the caller's,
+// possibly ADVANCED_OK-numbered, matching the one line actually received)
+// closes the reply: a real Marlin does emit extra unsolicited "ok"s for
+// its injected G28/G29S2, but this fake keeps the send window's ack
+// accounting simple by folding the whole chain into one reply.
+func (f *jtFake) mesh(body, ok string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := "0"
+	for _, tok := range strings.Fields(body) {
+		if strings.HasPrefix(tok, "S") {
+			s = strings.TrimPrefix(tok, "S")
+		}
+	}
+	switch s {
+	case "0":
+		if !f.meshValid {
+			return "Mesh Bed Leveling has no data.\n" + ok
+		}
+		onoff := "OFF"
+		if f.meshOn {
+			onoff = "ON"
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Mesh Bed Leveling %s\n5x5 mesh. Z offset: %.5f\n\nMeasured points:\n  0    1    2    3    4\n", onoff, f.meshZOff)
+		for y := 0; y < 5; y++ {
+			fmt.Fprintf(&b, " %d", y)
+			for x := 0; x < 5; x++ {
+				fmt.Fprintf(&b, " %+.5f", f.meshGrid[y][x])
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString(ok)
+		return b.String()
+	case "1":
+		f.meshIdx = 0
+		f.meshValid = false
+		return f.meshNextLocked(ok)
+	case "2":
+		return f.meshNextLocked(ok)
+	case "3":
+		var ix, iy int
+		var z float64
+		for _, tok := range strings.Fields(body) {
+			switch {
+			case strings.HasPrefix(tok, "I"):
+				fmt.Sscanf(tok[1:], "%d", &ix)
+			case strings.HasPrefix(tok, "J"):
+				fmt.Sscanf(tok[1:], "%d", &iy)
+			case strings.HasPrefix(tok, "Z"):
+				fmt.Sscanf(tok[1:], "%f", &z)
+			}
+		}
+		if ix >= 0 && ix < 5 && iy >= 0 && iy < 5 {
+			f.meshGrid[iy][ix] = z
+		}
+		return "X:0.00 Y:0.00 Z:0.20 E:0.00 Count X:0 Y:0 Z:80 E:0\n" + ok
+	case "4":
+		for _, tok := range strings.Fields(body) {
+			if strings.HasPrefix(tok, "Z") {
+				fmt.Sscanf(tok[1:], "%f", &f.meshZOff)
+			}
+		}
+		return "X:0.00 Y:0.00 Z:0.20 E:0.00 Count X:0 Y:0 Z:80 E:0\n" + ok
+	case "5":
+		f.meshValid, f.meshOn, f.meshZOff = false, false, 0
+		f.meshGrid = [5][5]float64{}
+		return ok
+	}
+	return ok
+}
+
+// meshNextLocked mirrors one G29 S2 call (mbl/G29.cpp MeshNext): the
+// caller holds f.mu. GRID_MAX_POINTS is 5x5 = 25.
+func (f *jtFake) meshNextLocked(ok string) string {
+	const total = 25
+	var b strings.Builder
+	if f.meshIdx < total {
+		f.meshIdx++
+		fmt.Fprintf(&b, "MBL G29 point %d of %d\n", f.meshIdx, total)
+		fmt.Fprintf(&b, "X:0.00 Y:0.00 Z:%.2f E:0.00 Count X:0 Y:0 Z:80 E:0\n", 0.2+float64(f.meshIdx)*0.01)
+	} else {
+		b.WriteString("Mesh probing done.\n")
+		f.meshIdx = -1
+		f.meshValid = true
+		f.meshOn = true
+		fmt.Fprintf(&b, "MBL G29 point %d of %d\n", f.meshIdx, total)
+		b.WriteString("X:0.00 Y:0.00 Z:5.00 E:0.00 Count X:0 Y:0 Z:2000 E:0\n")
+	}
+	b.WriteString(ok)
+	return b.String()
 }
 
 func (f *jtFake) count(prefix string) int {

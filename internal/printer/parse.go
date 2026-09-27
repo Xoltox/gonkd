@@ -217,3 +217,140 @@ func ParseCapability(line string) (name string, enabled bool, ok bool) {
 	}
 	return parts[0], parts[1] == "1", true
 }
+
+// ParseMBLPointLine parses Marlin's "MBL G29 point N of TOTAL" line
+// (src/gcode/bedlevel/mbl/G29.cpp:260), printed after every G29 S1/S2 call
+// that leaves state MeshNext. N is 1-based and is the point about to be
+// probed (or, on the call that finishes the last point, -1: see
+// ParseMeshDone for the real end-of-sequence signal).
+func ParseMBLPointLine(line string) (point, total int, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	const prefix = "MBL G29 point "
+	if !strings.HasPrefix(trimmed, prefix) {
+		return 0, 0, false
+	}
+	fields := strings.Fields(strings.TrimPrefix(trimmed, prefix))
+	if len(fields) != 3 || fields[1] != "of" {
+		return 0, 0, false
+	}
+	p, err1 := strconv.Atoi(fields[0])
+	t, err2 := strconv.Atoi(fields[2])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return p, t, true
+}
+
+// ParseMeshDone reports whether line is Marlin's "Mesh probing done."
+// (G29.cpp:198), sent once by the G29 S2 call that records the last point.
+// This, not the point number, is the reliable end-of-sequence signal: that
+// same call's own "MBL G29 point" line reports mbl_probe_index after it is
+// reset to -1 ("MBL G29 point -1 of N").
+func ParseMeshDone(line string) bool {
+	return strings.TrimSpace(line) == "Mesh probing done."
+}
+
+// ParsePositionZ extracts the Z value from a report_current_position()
+// line, e.g. "X:0.00 Y:0.00 Z:0.20 E:0.00 Count X:0 Y:0 Z:80 E:0"
+// (module/motion.cpp). Everything from "Count" on is stepper counts, not
+// logical position, so it is stripped before looking for "Z:" to avoid
+// picking up "Count ... Z:80" instead of the real value.
+func ParsePositionZ(line string) (float64, bool) {
+	trimmed := strings.TrimSpace(line)
+	if i := strings.Index(trimmed, "Count"); i >= 0 {
+		trimmed = trimmed[:i]
+	}
+	for _, f := range strings.Fields(trimmed) {
+		if strings.HasPrefix(f, "Z:") {
+			v, err := strconv.ParseFloat(f[2:], 64)
+			if err == nil {
+				return v, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// ParseMeshReport parses the full multi-line reply to "G29 S0"
+// (feature/bedlevel/mbl/mesh_bed_leveling.cpp report_mesh, and
+// feature/bedlevel/bedlevel.cpp print_2d_array with SCAD_MESH_OUTPUT
+// undefined, the default):
+//
+//	Mesh Bed Leveling ON
+//	5x5 mesh. Z offset: 0.00000
+//
+//	Measured points:
+//	  0    1    2    3    4
+//	 0 +0.00000 +0.02500 +0.00000 -0.01000 +0.00000
+//	 1 ...
+//
+// or a single "Mesh Bed Leveling has no data." line before the first
+// complete probe. ok is false only if a mesh was reported (ON/OFF) but the
+// grid that followed could not be parsed. Points is row-major, [y][x].
+func ParseMeshReport(lines []string) (active bool, zOffset float64, points [][]float64, ok bool) {
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		switch {
+		case strings.HasPrefix(line, "Mesh Bed Leveling "):
+			rest := strings.TrimPrefix(line, "Mesh Bed Leveling ")
+			if strings.HasPrefix(rest, "has no data") {
+				return false, 0, nil, true
+			}
+			active = rest == "ON"
+		case strings.Contains(line, "Z offset:"):
+			if idx := strings.Index(line, "Z offset:"); idx >= 0 {
+				v, err := strconv.ParseFloat(strings.TrimSpace(line[idx+len("Z offset:"):]), 64)
+				if err == nil {
+					zOffset = v
+				}
+			}
+		case line == "Measured points:":
+			grid, gok := parseMeshGrid(lines[i+1:])
+			if !gok {
+				return false, 0, nil, false
+			}
+			return active, zOffset, grid, true
+		}
+	}
+	return false, 0, nil, false
+}
+
+// parseMeshGrid reads the header row (used only for its column count) and
+// the data rows that follow ("<row index> <value>..."), stopping at the
+// first line that does not fit the pattern (typically "ok").
+func parseMeshGrid(rest []string) ([][]float64, bool) {
+	if len(rest) == 0 {
+		return nil, false
+	}
+	cols := len(strings.Fields(rest[0]))
+	if cols == 0 {
+		return nil, false
+	}
+	var grid [][]float64
+	for _, raw := range rest[1:] {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != cols+1 {
+			break
+		}
+		row := make([]float64, cols)
+		for i, f := range fields[1:] {
+			v, err := strconv.ParseFloat(f, 64)
+			if err != nil {
+				return nil, false
+			}
+			row[i] = v
+		}
+		grid = append(grid, row)
+		if len(grid) == cols {
+			break
+		}
+	}
+	if len(grid) == 0 {
+		return nil, false
+	}
+	return grid, true
+}
