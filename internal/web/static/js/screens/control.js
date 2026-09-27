@@ -1,10 +1,10 @@
 // Control: jog, home, motors off, extrude, heat, presets, tune.
-import { h, icon, region, setText } from '../dom.js';
+import { h, icon, region, setText, visiblePoll } from '../dom.js';
 import { card, btn, iconBtn, seg, banner, confirmButton, holdButton, note } from '../ui.js';
 import { phaseOf, act, jobActive, limitsOf, set, toast, connected } from '../store.js';
 import { api } from '../api.js';
 import { screenTitle, pageBanners, preheat, tuneCard, heatersOn } from './common.js';
-import { t1, DEG } from '../fmt.js';
+import { t1, ago, DEG } from '../fmt.js';
 
 const COLD_MIN = 170;
 const ui = { step: 10, elen: 5, efeed: 120 }; // kept across visits
@@ -21,8 +21,12 @@ export function mount(root) {
   const ext = extruderCard();
   const heat = heatCard();
   const tune = tuneCard((s) => !ready(s));
+  const coords = coordsCard();
   root.append(screenTitle('Control'), banners.el, lockNote.el,
-    h('div', { class: 'control-grid' }, move.el, ext.el, heat.el, tune.el));
+    h('div', { class: 'control-grid' }, move.el, ext.el, heat.el, tune.el, coords.el));
+  // POST /gonkd/position on open and every 3s while this screen and tab
+  // are visible; stops on its own once the router swaps the screen out.
+  visiblePoll(root, 3000, () => api.position().catch(() => {}));
   return (s) => {
     banners.update(s);
     lockNote.update(s);
@@ -30,6 +34,32 @@ export function mount(root) {
     ext.update(s);
     heat.update(s);
     tune.update(s);
+    coords.update(s);
+  };
+}
+
+// ---- live coordinates ----
+
+function coordsCard() {
+  const axisDD = () => h('dd', { class: 'num-l tnum', text: '--' });
+  const vals = { x: axisDD(), y: axisDD(), z: axisDD(), e: axisDD() };
+  const row = (k, label) => h('div', null, h('dt', { text: label }), vals[k]);
+  const age = h('p', { class: 'meta' });
+  const el = card('Position', 'control', [
+    h('dl', { class: 'times' }, row('x', 'X'), row('y', 'Y'), row('z', 'Z'), row('e', 'E')),
+    age,
+  ]);
+  return {
+    el,
+    update(s) {
+      const pos = s.snap && s.snap.position;
+      const fmt = (v) => (v == null ? '--' : v.toFixed(2));
+      setText(vals.x, fmt(pos && pos.x));
+      setText(vals.y, fmt(pos && pos.y));
+      setText(vals.z, fmt(pos && pos.z));
+      setText(vals.e, fmt(pos && pos.e));
+      setText(age, pos ? `As of ${ago(s.now - new Date(pos.at).getTime())}` : 'No position yet. Jog or home to fetch it.');
+    },
   };
 }
 

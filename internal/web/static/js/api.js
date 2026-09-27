@@ -72,6 +72,7 @@ export const api = {
   meshZOffset: (z, save) => post('/gonkd/mesh/zoffset', { z, save: !!save }),
   meshPoint: (x, y, z, save) => post('/gonkd/mesh/point', { x, y, z, save: !!save }),
   bedCorner: (corner) => post('/gonkd/bed/corner', { corner }),
+  position: () => post('/gonkd/position'),
 };
 
 export const thumbUrl = (short) => '/gonkd/files/thumb?name=' + encodeURIComponent(short);

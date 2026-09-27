@@ -271,6 +271,42 @@ func ParsePositionZ(line string) (float64, bool) {
 	return 0, false
 }
 
+// ParsePosition extracts X, Y, Z and E from a report_current_position()
+// line (see ParsePositionZ for the "Count" stripping this shares), e.g.
+// "X:0.00 Y:0.00 Z:0.20 E:0.00 Count X:0 Y:0 Z:80 E:0". ok is true only if
+// all four axes were found, which every M114 reply on this firmware
+// build provides.
+func ParsePosition(line string) (Position, bool) {
+	var p Position
+	trimmed := strings.TrimSpace(line)
+	if i := strings.Index(trimmed, "Count"); i >= 0 {
+		trimmed = trimmed[:i]
+	}
+	found := 0
+	for _, f := range strings.Fields(trimmed) {
+		var dst *float64
+		switch {
+		case strings.HasPrefix(f, "X:"):
+			dst = &p.X
+		case strings.HasPrefix(f, "Y:"):
+			dst = &p.Y
+		case strings.HasPrefix(f, "Z:"):
+			dst = &p.Z
+		case strings.HasPrefix(f, "E:"):
+			dst = &p.E
+		default:
+			continue
+		}
+		v, err := strconv.ParseFloat(f[2:], 64)
+		if err != nil {
+			continue
+		}
+		*dst = v
+		found++
+	}
+	return p, found == 4
+}
+
 // ParseMeshReport parses the full multi-line reply to "G29 S0"
 // (feature/bedlevel/mbl/mesh_bed_leveling.cpp report_mesh, and
 // feature/bedlevel/bedlevel.cpp print_2d_array with SCAD_MESH_OUTPUT

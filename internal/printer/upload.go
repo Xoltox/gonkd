@@ -63,19 +63,24 @@ var drainProbeAfter = 10 * time.Second
 //
 // The caller is responsible for deleting localPath afterward and for
 // issuing M23/M24 if the file should print immediately.
-func (d *Driver) UploadToSD(ctx context.Context, localPath, longName string, names *NameMap, progress ProgressFunc) (string, error) {
+// The returned cardBytes is the number of bytes the printer's own SD copy
+// ends up holding (every line comment-stripped and filtered like
+// uploadASCII/uploadBinary), which is usually less than the local file
+// size and is what M27 "SD printing byte X/Y" later measures progress
+// against.
+func (d *Driver) UploadToSD(ctx context.Context, localPath, longName string, names *NameMap, progress ProgressFunc) (short string, cardBytes int64, err error) {
 	if names == nil {
-		return "", errors.New("upload: no name map")
+		return "", 0, errors.New("upload: no name map")
 	}
 	info, err := os.Stat(localPath)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	size := info.Size()
 
 	gen, err := d.beginUpload()
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer d.endUpload()
 
@@ -83,11 +88,11 @@ func (d *Driver) UploadToSD(ctx context.Context, localPath, longName string, nam
 	// card (not created by gonkd) is never overwritten by M28.
 	if err := d.refreshListing(ctx, gen); err != nil {
 		if ctx.Err() != nil || errors.Is(err, errPrinterReset) || errors.Is(err, ErrClosed) {
-			return "", err
+			return "", 0, err
 		}
 		log.Printf("gonkd: upload: SD listing not refreshed (%v), using the last one", err)
 	}
-	short := d.assignShort(names, longName)
+	short = d.assignShort(names, longName)
 
 	start := time.Now()
 	used, detail := ProtoASCII, ""
@@ -95,6 +100,7 @@ func (d *Driver) UploadToSD(ctx context.Context, localPath, longName string, nam
 		used = ProtoBinary
 		var st binStats
 		st, err = d.uploadBinary(ctx, gen, localPath, short, progress)
+		cardBytes = st.CardBytes
 		detail = fmt.Sprintf(", %d bytes on the wire, %d resends", st.Wire, st.Resends)
 		if st.Compressed {
 			detail += ", heatshrink"
@@ -103,20 +109,20 @@ func (d *Driver) UploadToSD(ctx context.Context, localPath, longName string, nam
 			log.Printf("gonkd: upload %s: binary transfer did not start (%v), using ASCII", short, err)
 			used, detail = ProtoASCII, ""
 			start = time.Now()
-			err = d.uploadASCII(ctx, gen, localPath, short, size, progress)
+			cardBytes, err = d.uploadASCII(ctx, gen, localPath, short, size, progress)
 		}
 	} else {
-		err = d.uploadASCII(ctx, gen, localPath, short, size, progress)
+		cardBytes, err = d.uploadASCII(ctx, gen, localPath, short, size, progress)
 	}
 	if err != nil {
 		log.Printf("gonkd: upload %s via %s failed after %.1fs: %v", short, used, time.Since(start).Seconds(), err)
 		names.Forget(short)
-		return "", err
+		return "", 0, err
 	}
 	dur := time.Since(start)
 	log.Printf("gonkd: upload %s via %s: %d bytes in %.1fs, %.1f KB/s%s",
 		short, used, size, dur.Seconds(), float64(size)/1000/max(dur.Seconds(), 0.001), detail)
-	return short, nil
+	return short, cardBytes, nil
 }
 
 func (d *Driver) beginUpload() (uint64, error) {
@@ -204,10 +210,10 @@ func (d *Driver) assignShort(names *NameMap, longName string) string {
 // windowed queue, so Marlin's acks pace it exactly as they do a live print.
 // Marlin writes every line it receives into the open file, which is why
 // the upload must own the port.
-func (d *Driver) uploadASCII(ctx context.Context, gen uint64, localPath, short string, size int64, progress ProgressFunc) error {
+func (d *Driver) uploadASCII(ctx context.Context, gen uint64, localPath, short string, size int64, progress ProgressFunc) (int64, error) {
 	f, err := os.Open(localPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 
@@ -215,20 +221,20 @@ func (d *Driver) uploadASCII(ctx context.Context, gen uint64, localPath, short s
 	// every following line would run as live G-code.
 	d.m28.Store(m28Waiting)
 	if err := d.sendOwned(ctx, gen, "M28 "+short); err != nil {
-		return err
+		return 0, err
 	}
 	if err := d.waitFor(ctx, gen, m28Timeout, func() bool { return d.m28.Load() != m28Waiting }); err != nil {
 		d.abortUpload(gen, short)
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
-		return fmt.Errorf("M28 %s: %w", short, err)
+		return 0, fmt.Errorf("M28 %s: %w", short, err)
 	}
 	if d.m28.Load() != m28Opened {
-		return fmt.Errorf("M28 %s: printer could not open the file", short)
+		return 0, fmt.Errorf("M28 %s: printer could not open the file", short)
 	}
 
-	var sent, reported int64
+	var sent, reported, cardOffset int64
 	lineNo := 0
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 4096), uploadMaxLine)
@@ -236,26 +242,30 @@ func (d *Driver) uploadASCII(ctx context.Context, gen uint64, localPath, short s
 		line := scanner.Text()
 		lineNo++
 		sent += int64(len(line)) + 1
-		if d.metaFeed != nil {
-			d.metaFeed(line)
-		}
 		cmd := stripComment(line)
-		if cmd == "" || isSaveControl(cmd) || hasM110(cmd) {
+		skip := cmd == "" || isSaveControl(cmd) || hasM110(cmd)
+		if !skip {
+			cardOffset += int64(len(cmd)) + 1
+		}
+		if d.metaFeed != nil {
+			d.metaFeed(line, cardOffset)
+		}
+		if skip {
 			continue
 		}
 		if !d.fits(cmd) {
 			// Marlin would truncate it, checksum included, and ask for it
 			// again forever with the file open.
 			d.abortUpload(gen, short)
-			return fmt.Errorf("G-code line %d is too long for the printer: %d bytes after comment removal, framed line would exceed Marlin's %d-byte limit",
+			return 0, fmt.Errorf("G-code line %d is too long for the printer: %d bytes after comment removal, framed line would exceed Marlin's %d-byte limit",
 				lineNo, len(cmd), gcode.MaxFramedLen)
 		}
 		if err := d.sendOwned(ctx, gen, cmd); err != nil {
 			if ctx.Err() != nil {
 				d.abortUpload(gen, short)
-				return ctx.Err()
+				return 0, ctx.Err()
 			}
-			return err
+			return 0, err
 		}
 		if progress != nil && sent-reported >= 4096 {
 			reported = sent
@@ -264,30 +274,30 @@ func (d *Driver) uploadASCII(ctx context.Context, gen uint64, localPath, short s
 	}
 	if err := scanner.Err(); err != nil {
 		d.abortUpload(gen, short)
-		return fmt.Errorf("read %s: %w", localPath, err)
+		return 0, fmt.Errorf("read %s: %w", localPath, err)
 	}
 
 	if err := d.sendOwned(ctx, gen, "M29"); err != nil {
 		if ctx.Err() != nil {
 			d.abortUpload(gen, short)
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
-		return err
+		return 0, err
 	}
 	if err := d.waitDrained(ctx, gen); err != nil {
 		if ctx.Err() != nil {
 			d.abortUpload(gen, short) // M29 is already queued; this deletes the file
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
-		return err
+		return 0, err
 	}
 	if d.writeErr.Load() {
-		return fmt.Errorf("printer reported an SD write error for %s", short)
+		return 0, fmt.Errorf("printer reported an SD write error for %s", short)
 	}
 	if progress != nil {
 		progress(size, size)
 	}
-	return nil
+	return cardOffset, nil
 }
 
 // waitDrained waits until the M29 (and everything before it) is acked. A
@@ -365,7 +375,8 @@ type binStats struct {
 	Wire        int64
 	Resends     int
 	Compressed  bool
-	CanFallBack bool // failed before any file was created, printer back in ASCII mode
+	CanFallBack bool  // failed before any file was created, printer back in ASCII mode
+	CardBytes   int64 // bytes actually written to the card's copy (comment-stripped)
 }
 
 // uploadBinary sends the file with Marlin's BINARY_FILE_TRANSFER protocol
@@ -521,7 +532,7 @@ func (d *Driver) uploadBinary(ctx context.Context, gen uint64, localPath, short 
 		return st, err
 	}
 
-	var sent, reported int64
+	var sent, reported, cardOffset int64
 	lineNo := 0
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 4096), uploadMaxLine)
@@ -532,11 +543,15 @@ func (d *Driver) uploadBinary(ctx context.Context, gen uint64, localPath, short 
 		line := scanner.Text()
 		lineNo++
 		sent += int64(len(line)) + 1
-		if d.metaFeed != nil {
-			d.metaFeed(line)
-		}
 		cmd := stripComment(line)
-		if cmd == "" || isSaveControl(cmd) || hasM110(cmd) {
+		skip := cmd == "" || isSaveControl(cmd) || hasM110(cmd)
+		if !skip {
+			cardOffset += int64(len(cmd)) + 1
+		}
+		if d.metaFeed != nil {
+			d.metaFeed(line, cardOffset)
+		}
+		if skip {
 			continue
 		}
 		if len(cmd) > gcode.MaxFramedLen {
@@ -567,6 +582,7 @@ func (d *Driver) uploadBinary(ctx context.Context, gen uint64, localPath, short 
 		return fail(err)
 	}
 	exit()
+	st.CardBytes = cardOffset
 	if progress != nil {
 		progress(size, size)
 	}

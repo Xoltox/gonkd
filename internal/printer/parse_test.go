@@ -21,6 +21,25 @@ func TestParseTempsNoMatch(t *testing.T) {
 	}
 }
 
+func TestParsePosition(t *testing.T) {
+	p, ok := ParsePosition("X:1.50 Y:2.75 Z:0.20 E:12.30 Count X:120 Y:220 Z:80 E:0")
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	if p.X != 1.50 || p.Y != 2.75 || p.Z != 0.20 || p.E != 12.30 {
+		t.Fatalf("p = %+v", p)
+	}
+}
+
+func TestParsePositionNoMatch(t *testing.T) {
+	if _, ok := ParsePosition("ok"); ok {
+		t.Fatal("expected no match")
+	}
+	if _, ok := ParsePosition("X:1.00 Y:2.00 Z:0.20 Count X:0 Y:0 Z:0 E:0"); ok {
+		t.Fatal("missing E must not match")
+	}
+}
+
 func TestParseSDStatusPrinting(t *testing.T) {
 	s, ok := ParseSDStatus("SD printing byte 12345/67890")
 	if !ok || !s.Printing || s.Current != 12345 || s.Total != 67890 {

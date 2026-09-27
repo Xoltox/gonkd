@@ -10,6 +10,17 @@ import (
 	"testing"
 )
 
+// feedAll feeds lines to p in order with an increasing card-space offset,
+// approximating what upload.go's cardOffset accumulator does (it need not
+// match exactly for these tests, only increase monotonically).
+func feedAll(p *metaParser, lines []string) {
+	var off int64
+	for _, line := range lines {
+		off += int64(len(line)) + 1
+		p.feed(line, off)
+	}
+}
+
 // tiny1x1PNGBase64 is a real 1x1 transparent PNG, base64-encoded, used to
 // exercise the thumbnail decode path without shipping a binary fixture.
 const tiny1x1PNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
@@ -44,9 +55,7 @@ func orcaSampleLines() []string {
 
 func TestMetaParserOrcaHeaderFooterAndThumbnail(t *testing.T) {
 	p := &metaParser{}
-	for _, line := range orcaSampleLines() {
-		p.feed(line)
-	}
+	feedAll(p, orcaSampleLines())
 	meta, png := p.result()
 
 	if meta.Slicer != "OrcaSlicer 2.1.0" {
@@ -92,9 +101,7 @@ func min(a, b int) int {
 // M104/M140 in the body sets the temperatures.
 func TestMetaParserCommandFallback(t *testing.T) {
 	p := &metaParser{}
-	for _, line := range []string{"G28", "M104 S200", "M140 S60", "M104 S210"} {
-		p.feed(line)
-	}
+	feedAll(p, []string{"G28", "M104 S200", "M140 S60", "M104 S210"})
 	meta, _ := p.result()
 	if meta.HotendC != 200 || meta.BedC != 60 {
 		t.Fatalf("meta = %+v, want first M104/M140 only", meta)
@@ -105,13 +112,11 @@ func TestMetaParserCommandFallback(t *testing.T) {
 // must not be kept.
 func TestMetaParserOversizeThumbnailDropped(t *testing.T) {
 	p := &metaParser{}
-	for _, line := range []string{
+	feedAll(p, []string{
 		"; thumbnail begin 400x400 4",
 		"; QUJD",
 		"; thumbnail end",
-	} {
-		p.feed(line)
-	}
+	})
 	meta, png := p.result()
 	if meta.Thumb || png != nil {
 		t.Fatalf("oversize thumbnail was kept: meta=%+v png_len=%d", meta, len(png))
@@ -124,16 +129,14 @@ func TestMetaParserOversizeThumbnailDropped(t *testing.T) {
 func TestMetaParserKeepsLargestThumbnail(t *testing.T) {
 	p := &metaParser{}
 	small := "; " + tiny1x1PNGBase64
-	for _, line := range []string{
+	feedAll(p, []string{
 		"; thumbnail begin 16x16 " + strconv.Itoa(len(tiny1x1PNGBase64)),
 		small,
 		"; thumbnail end",
 		"; thumbnail begin 200x200 " + strconv.Itoa(len(tiny1x1PNGBase64)),
 		small,
 		"; thumbnail end",
-	} {
-		p.feed(line)
-	}
+	})
 	if p.bestThumb == nil || p.bestThumb.w != 200 {
 		t.Fatalf("bestThumb = %+v, want the 200x200 block", p.bestThumb)
 	}
@@ -240,9 +243,7 @@ func orcaPauseSampleLines() []string {
 
 func TestMetaParserPauseExtraction(t *testing.T) {
 	p := &metaParser{}
-	for _, line := range orcaPauseSampleLines() {
-		p.feed(line)
-	}
+	feedAll(p, orcaPauseSampleLines())
 	meta, _ := p.result()
 
 	if len(meta.Pauses) != 2 {
@@ -271,7 +272,7 @@ func TestMetaParserPauseExtraction(t *testing.T) {
 func TestMetaParserPauseCap(t *testing.T) {
 	p := &metaParser{}
 	for i := 0; i < maxPauses+10; i++ {
-		p.feed("M0 stop")
+		p.feed("M0 stop", int64(i+1)*8)
 	}
 	meta, _ := p.result()
 	if len(meta.Pauses) != maxPauses {

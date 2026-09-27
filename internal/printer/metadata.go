@@ -34,6 +34,37 @@ type SDMeta struct {
 	// (no ADVANCED_PAUSE_FEATURE: M600/M601 print "Unknown command" and the
 	// print keeps going), deduplicated in first-seen order.
 	Unsupported []string `json:"unsupported,omitempty"`
+
+	// LayerCount is the total number of layers found during the scan; it
+	// is small and safe to show in the /gonkd/files listing, unlike the
+	// Layers/M73 tables below.
+	LayerCount int `json:"layerCount,omitempty"`
+
+	// Layers and M73 are the server-side ETA/layer tables recorded during
+	// the upload scan (see metaParser.addLayer/addM73). They can hold up
+	// to layerTableCap/m73TableCap entries and are only ever read
+	// server-side (Manager.applyPrintProgress): the /gonkd/files listing
+	// strips them before responding (Manager.SDFiles) to keep that
+	// response small.
+	Layers []LayerPoint `json:"layers,omitempty"`
+	M73    []M73Point   `json:"m73,omitempty"`
+}
+
+// LayerPoint is one layer boundary found during the upload scan: the
+// card-space byte offset (matching M27 "SD printing byte X/Y") where the
+// layer begins, and its Z height.
+type LayerPoint struct {
+	O int64   `json:"o"`
+	Z float64 `json:"z"`
+}
+
+// M73Point is one "M73 P.. R.." progress checkpoint found during the
+// upload scan: the card-space byte offset, the slicer's reported percent
+// and its remaining time in seconds (R is minutes in the G-code).
+type M73Point struct {
+	O int64 `json:"o"`
+	P int   `json:"p"`
+	R int   `json:"r"`
 }
 
 // Pause is one point in a sliced file where it asks the printer to stop for
@@ -68,18 +99,29 @@ type metaParser struct {
 	hotendSet bool
 	bedSet    bool
 
-	offset             int64  // bytes of the file consumed so far, for Pause.Offset
+	offset             int64  // card-space bytes written so far, for Pause.Offset/Layers/M73 (set by feed's cardOffset)
 	layer              int    // current slicer layer, tracked from LAYER_CHANGE/LAYER:/Z: comments
 	pendingLayerChange bool   // a LAYER_CHANGE or LAYER: comment was just seen, awaiting its Z:
+	pendingLayerZ      bool   // a layer boundary was seen; the next Z: (or first G1 Z) records it
 	lastM117           string // most recent M117 text, used as the pause message fallback
+
+	layerStride, layerSeen int // addLayer's decimation state (see appendLayer)
+	m73Stride, m73Seen     int // addM73's decimation state (see appendM73)
 }
+
+// layerTableCap and m73TableCap bound SDMeta.Layers/M73 (contract: 3000/
+// 1000 entries, thinning evenly once full).
+const (
+	layerTableCap = 3000
+	m73TableCap   = 1000
+)
 
 // maxThumbDim is the largest thumbnail width/height gonkd will keep; the UI
 // only ever shows it at file-list thumbnail size.
 const maxThumbDim = 300
 
-func (p *metaParser) feed(line string) {
-	p.offset += int64(len(line)) + 1 // +1 for the newline the scanner split on
+func (p *metaParser) feed(line string, cardOffset int64) {
+	p.offset = cardOffset // card-space, matching M27 "SD printing byte X/Y" (see driver.go's metaFeed)
 	if p.curThumb != nil {
 		t := strings.TrimSpace(line)
 		if strings.HasPrefix(t, ";") && strings.Contains(t, "thumbnail") && strings.Contains(t, "end") {
@@ -155,18 +197,26 @@ func (p *metaParser) feedComment(body string) {
 	case body == "LAYER_CHANGE":
 		p.layer++
 		p.pendingLayerChange = true
+		p.pendingLayerZ = true
 		return
 	case strings.HasPrefix(body, "LAYER:"):
 		if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(body, "LAYER:"))); err == nil {
 			p.layer = v
 		}
 		p.pendingLayerChange = true
+		p.pendingLayerZ = true
 		return
 	case strings.HasPrefix(body, "Z:"):
 		if p.pendingLayerChange {
 			p.pendingLayerChange = false
 		} else {
 			p.layer++
+		}
+		if p.pendingLayerZ {
+			if v, ok := firstFloat(strings.TrimPrefix(body, "Z:")); ok {
+				p.addLayer(v)
+			}
+			p.pendingLayerZ = false
 		}
 		return
 	}
@@ -246,6 +296,18 @@ func (p *metaParser) feedCommand(t string) {
 		p.addPause(word, p.lastM117)
 	case fields[0] == "@pause" || word == "@PAUSE":
 		p.addPause("@pause", p.lastM117)
+	case word == "M73":
+		p.feedM73(fields)
+	}
+
+	// Cura's "LAYER:<n>" carries no Z: comment of its own; the layer's Z
+	// is instead read off its first G1/G0 move that sets Z, same as the
+	// slicer's own LCD progress display would.
+	if p.pendingLayerZ && (word == "G1" || word == "G0") {
+		if z, ok := gcodeZParam(fields); ok {
+			p.addLayer(z)
+			p.pendingLayerZ = false
+		}
 	}
 
 	if p.hotendSet && p.bedSet {
@@ -286,6 +348,96 @@ func (p *metaParser) addUnsupported(cmd string) {
 		}
 	}
 	p.meta.Unsupported = append(p.meta.Unsupported, cmd)
+}
+
+// addLayer records one LayerPoint at the parser's current (card-space)
+// offset, decimated once meta.Layers passes layerTableCap: every stride-th
+// point is kept, and the stride doubles (halving the buffer) each time it
+// would otherwise overflow, so the table stays representative of the
+// whole file rather than just its first layerTableCap layers.
+func (p *metaParser) addLayer(z float64) {
+	if p.layerStride == 0 {
+		p.layerStride = 1
+	}
+	keep := p.layerSeen%p.layerStride == 0
+	p.layerSeen++
+	if !keep {
+		return
+	}
+	p.meta.Layers = append(p.meta.Layers, LayerPoint{O: p.offset, Z: z})
+	if len(p.meta.Layers) > layerTableCap {
+		thinned := p.meta.Layers[:0]
+		for i, v := range p.meta.Layers {
+			if i%2 == 0 {
+				thinned = append(thinned, v)
+			}
+		}
+		p.meta.Layers = thinned
+		p.layerStride *= 2
+	}
+}
+
+// feedM73 parses "M73 P<percent> R<minutes>" and records an M73Point at
+// the parser's current offset. P alone (no R) is still recorded with
+// R left at 0 rather than skipped: some slicers only emit P.
+func (p *metaParser) feedM73(fields []string) {
+	var pct int
+	var rem int
+	haveP := false
+	for _, f := range fields[1:] {
+		if len(f) < 2 {
+			continue
+		}
+		switch f[0] {
+		case 'P', 'p':
+			if v, err := strconv.Atoi(f[1:]); err == nil {
+				pct, haveP = v, true
+			}
+		case 'R', 'r':
+			if v, err := strconv.Atoi(f[1:]); err == nil {
+				rem = v * 60
+			}
+		}
+	}
+	if !haveP {
+		return
+	}
+	p.addM73(pct, rem)
+}
+
+// addM73 records one M73Point, decimated exactly like addLayer but against
+// m73TableCap.
+func (p *metaParser) addM73(pct, remSec int) {
+	if p.m73Stride == 0 {
+		p.m73Stride = 1
+	}
+	keep := p.m73Seen%p.m73Stride == 0
+	p.m73Seen++
+	if !keep {
+		return
+	}
+	p.meta.M73 = append(p.meta.M73, M73Point{O: p.offset, P: pct, R: remSec})
+	if len(p.meta.M73) > m73TableCap {
+		thinned := p.meta.M73[:0]
+		for i, v := range p.meta.M73 {
+			if i%2 == 0 {
+				thinned = append(thinned, v)
+			}
+		}
+		p.meta.M73 = thinned
+		p.m73Stride *= 2
+	}
+}
+
+// gcodeZParam returns the Z parameter of a G0/G1 command, if any.
+func gcodeZParam(fields []string) (float64, bool) {
+	for _, f := range fields[1:] {
+		if len(f) > 1 && (f[0] == 'Z' || f[0] == 'z') {
+			v, err := strconv.ParseFloat(f[1:], 64)
+			return v, err == nil
+		}
+	}
+	return 0, false
 }
 
 func sValue(fields []string) (float64, bool) {
@@ -336,6 +488,7 @@ func parseSlicerDuration(s string) (int, bool) {
 // thumbnail PNG bytes if a usable one was found.
 func (p *metaParser) result() (SDMeta, []byte) {
 	meta := p.meta
+	meta.LayerCount = p.layer
 	if p.bestThumb == nil {
 		return meta, nil
 	}

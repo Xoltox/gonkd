@@ -135,7 +135,7 @@ func TestSendDuringUploadIsBusy(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := d.UploadToSD(context.Background(), path, "big.gcode", names, nil)
+		_, _, err := d.UploadToSD(context.Background(), path, "big.gcode", names, nil)
 		done <- err
 	}()
 	waitUntil(t, 2*time.Second, "upload in progress", func() bool {
@@ -152,7 +152,7 @@ func TestSendDuringUploadIsBusy(t *testing.T) {
 	if err := d.RefreshFiles(); !errors.Is(err, ErrBusy) {
 		t.Fatalf("RefreshFiles during upload = %v, want ErrBusy", err)
 	}
-	if _, err := d.UploadToSD(context.Background(), path, "b.gcode", names, nil); !errors.Is(err, ErrBusy) {
+	if _, _, err := d.UploadToSD(context.Background(), path, "b.gcode", names, nil); !errors.Is(err, ErrBusy) {
 		t.Fatalf("second upload = %v, want ErrBusy", err)
 	}
 	// Emergency commands bypass ownership. The fake is not reading right
@@ -185,7 +185,7 @@ func TestUploadWaitsForM29Ack(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := d.UploadToSD(context.Background(), path, "wait.gcode", names, nil)
+		_, _, err := d.UploadToSD(context.Background(), path, "wait.gcode", names, nil)
 		done <- err
 	}()
 	waitUntil(t, 2*time.Second, "M29 received", func() bool {
@@ -216,7 +216,7 @@ func TestUploadCancelSendsM29(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := d.UploadToSD(ctx, path, "cancel.gcode", names, nil)
+		_, _, err := d.UploadToSD(ctx, path, "cancel.gcode", names, nil)
 		done <- err
 	}()
 	waitUntil(t, 2*time.Second, "upload in progress", func() bool {
@@ -256,7 +256,7 @@ func TestUploadOpenFailed(t *testing.T) {
 	d, fm := startDriver(t, func(fm *fakeMarlin) { fm.failOpen = true })
 	names := NewNameMap(t.TempDir() + "/names.json")
 	path := writeGcode(t, 10)
-	if _, err := d.UploadToSD(context.Background(), path, "x.gcode", names, nil); err == nil {
+	if _, _, err := d.UploadToSD(context.Background(), path, "x.gcode", names, nil); err == nil {
 		t.Fatal("upload succeeded although M28 failed")
 	}
 	for _, c := range fm.acceptedCmds() {
@@ -369,7 +369,7 @@ func TestDoneOnEOF(t *testing.T) {
 	if err := d.Send("G28"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Send after EOF = %v, want ErrClosed", err)
 	}
-	if _, err := d.UploadToSD(context.Background(), writeGcode(t, 1), "a.gcode", NewNameMap(t.TempDir()+"/n.json"), nil); !errors.Is(err, ErrClosed) {
+	if _, _, err := d.UploadToSD(context.Background(), writeGcode(t, 1), "a.gcode", NewNameMap(t.TempDir()+"/n.json"), nil); !errors.Is(err, ErrClosed) {
 		t.Fatalf("upload after EOF = %v, want ErrClosed", err)
 	}
 }
@@ -496,7 +496,7 @@ func TestUploadRejectsTooLongLine(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := d.UploadToSD(context.Background(), path, "long.gcode", names, nil)
+	_, _, err := d.UploadToSD(context.Background(), path, "long.gcode", names, nil)
 	if err == nil || !strings.Contains(err.Error(), "line 3") {
 		t.Fatalf("upload = %v, want an error naming line 3", err)
 	}
@@ -531,7 +531,7 @@ func TestUploadLostM29OKCompletes(t *testing.T) {
 	path := writeGcode(t, 30)
 	done := make(chan error, 1)
 	go func() {
-		_, err := d.UploadToSD(context.Background(), path, "lost.gcode", names, nil)
+		_, _, err := d.UploadToSD(context.Background(), path, "lost.gcode", names, nil)
 		done <- err
 	}()
 	select {

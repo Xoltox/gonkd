@@ -75,7 +75,7 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, printer.ErrInvalidCommand), errors.Is(err, printer.ErrInvalidMode),
 		errors.Is(err, printer.ErrTooManyPresets), errors.Is(err, printer.ErrInvalidPreset):
 		code = http.StatusBadRequest
-	case errors.Is(err, printer.ErrUnknownFile):
+	case errors.Is(err, printer.ErrUnknownFile), errors.Is(err, printer.ErrNoMesh):
 		code = http.StatusNotFound
 	case errors.Is(err, printer.ErrTimeout):
 		code = http.StatusServiceUnavailable
@@ -119,6 +119,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/gonkd/mesh/zoffset", s.handleMeshZOffset)
 	mux.HandleFunc("/gonkd/mesh/point", s.handleMeshPoint)
 	mux.HandleFunc("/gonkd/bed/corner", s.handleBedCorner)
+	mux.HandleFunc("/gonkd/position", s.handlePosition)
 }
 
 // --- CSRF / Host hardening (SEC-5, SEC-25) ---
@@ -636,7 +637,9 @@ func (s *Server) handleJog(w http.ResponseWriter, r *http.Request) {
 	}
 	feed = clamp(feed, 1, 10000)
 
-	cmds := []string{"G91", fmt.Sprintf("G1 %s%.4f F%.0f", axis, dist, feed), "G90"}
+	// M114 after the move so Snapshot's position reflects it (contract:
+	// position refresh after every jog).
+	cmds := []string{"G91", fmt.Sprintf("G1 %s%.4f F%.0f", axis, dist, feed), "G90", "M114"}
 	if err := s.Mgr.SendSequence(cmds); err != nil {
 		writeErr(w, err)
 		return
@@ -734,15 +737,17 @@ func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleMesh implements GET /gonkd/mesh: the current mesh (G29 S0),
-// blocked (like every mesh/bed route) while a job runs.
+// handleMesh implements GET /gonkd/mesh: the current mesh (G29 S0). While a
+// job runs (every other mesh/bed route is refused with ErrJobActive) this
+// instead returns the Manager's last cached mesh with "cached":true, or
+// 404 if there has never been one.
 func (s *Server) handleMesh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	mesh, err := s.Mgr.MeshReport()
+	mesh, err := s.Mgr.MeshReportOrCached()
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -882,6 +887,22 @@ func (s *Server) handleBedCorner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Mgr.BedCorner(printer.Corner(body.Corner)); err != nil {
+		writeErr(w, err)
+		return
+	}
+	noContent(w)
+}
+
+// handlePosition implements POST /gonkd/position: asks the printer for its
+// position (M114), parsed automatically into Snapshot's "position". Allowed
+// while printing (unlike jog/home/corner, this is not a move); rate
+// limited (Manager.RequestPosition), so a burst of calls (the UI polls
+// every 3s while a screen is open) is silently coalesced, not an error.
+func (s *Server) handlePosition(w http.ResponseWriter, r *http.Request) {
+	if !s.checkMutation(w, r, false) {
+		return
+	}
+	if err := s.Mgr.RequestPosition(); err != nil {
 		writeErr(w, err)
 		return
 	}

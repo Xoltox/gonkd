@@ -540,7 +540,7 @@ func TestDriverASCIIUploadCapturesBytes(t *testing.T) {
 	}
 
 	var lastSent, lastTotal int64
-	short, err := d.UploadToSD(context.Background(), path, "test.gcode", names, func(s, tot int64) {
+	short, _, err := d.UploadToSD(context.Background(), path, "test.gcode", names, func(s, tot int64) {
 		lastSent, lastTotal = s, tot
 	})
 	if err != nil {
@@ -599,7 +599,7 @@ func TestUploadSurvivesCorruptionAndRXFlush(t *testing.T) {
 	var short string
 	go func() {
 		var err error
-		short, err = d.UploadToSD(context.Background(), writeGcode(t, lines), "lossy.gcode", names, nil)
+		short, _, err = d.UploadToSD(context.Background(), writeGcode(t, lines), "lossy.gcode", names, nil)
 		done <- err
 	}()
 	select {

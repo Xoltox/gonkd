@@ -283,6 +283,22 @@ body:has(.has-actionbar) .toast-host { bottom: calc(var(--nav-h) + var(--bar-h) 
 .pct-sign { font-family: var(--display); font-size: 1.75rem; color: var(--text-2); margin-left: 4px; }
 .times { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
 .times dt { font-size: .8125rem; color: var(--text-2); }
+.times .time-hint { display: block; }
+.times .time-btn {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  min-height: 48px;
+  padding: 4px 6px;
+  margin: -4px -6px;
+  border-radius: var(--r-ctl);
+  cursor: pointer;
+}
+.times .time-btn:hover { background: var(--surface-inset); }
+.times .time-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .thumb { border-radius: var(--r-ctl); background: var(--surface-inset); object-fit: contain; flex: none; border: 1px solid var(--border); }
 .thumb-s { width: 56px; height: 56px; }
 .thumb-l { width: 96px; height: 96px; }

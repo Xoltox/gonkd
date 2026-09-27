@@ -70,6 +70,26 @@ type Job struct {
 	ETASec     float64    `json:"etaSec"`
 	BabystepMM float64    `json:"babystepMm"`     // running total since last M500
 	Note       string     `json:"note,omitempty"` // e.g. link lost while an SD print may still run
+
+	// Layer/LayerTotal/Z/EtaSource are filled in by Snapshot from the
+	// file's recorded meta tables (see MetaStore, metaParser) cross
+	// referenced against the current card-space byte offset; they stay
+	// zero (and omitted) for a job gonkd has no metadata for, e.g. one
+	// started on the printer's own LCD/console.
+	Layer      int     `json:"layer,omitempty"`      // 1-based
+	LayerTotal int     `json:"layerTotal,omitempty"` // from meta.layerCount
+	Z          float64 `json:"z,omitempty"`          // planned Z at the current offset, from the layer table
+	EtaSource  string  `json:"etaSource,omitempty"`  // "m73", "slicer" or "live"
+
+	// short is the SD short name of the file this job printed, used to
+	// look up its recorded meta tables (layers/m73) at Snapshot time. Not
+	// set for a job gonkd did not start itself (see lcdJobName).
+	short string
+	// firstByteAt is when SentBytes first became > 0 during an SD print
+	// (setSDProgress), i.e. once Marlin is actually reading the card
+	// rather than still heating; ETA's "live"/"slicer" fallbacks count
+	// elapsed time from here, not from StartedAt.
+	firstByteAt time.Time
 }
 
 // Tune holds the live speed/flow/fan overrides gonkd last sent, defaulting
@@ -107,6 +127,18 @@ type Leveling struct {
 	Z     float64 `json:"z"`
 }
 
+// Position is the toolhead's last confirmed position, parsed from an M114
+// reply ("X:.. Y:.. Z:.. E:.. Count ..."), sent on demand by POST
+// /gonkd/position and automatically after a jog, home, corner move or mesh
+// Z adjust.
+type Position struct {
+	X  float64   `json:"x"`
+	Y  float64   `json:"y"`
+	Z  float64   `json:"z"`
+	E  float64   `json:"e"`
+	At time.Time `json:"at"`
+}
+
 // Snapshot is the full point-in-time state returned by the JSON API.
 type Snapshot struct {
 	Version      string    `json:"version"`
@@ -121,6 +153,7 @@ type Snapshot struct {
 	Limits       Limits    `json:"limits"`
 	UserWait     *UserWait `json:"userWait,omitempty"`
 	Leveling     *Leveling `json:"leveling,omitempty"`
+	Position     *Position `json:"position,omitempty"`
 }
 
 // Mesh is the parsed reply to "G29 S0" (mbl/G29.cpp MeshReport case): the
@@ -135,4 +168,8 @@ type Mesh struct {
 	Min     float64     `json:"min,omitempty"`
 	Max     float64     `json:"max,omitempty"`
 	Range   float64     `json:"range,omitempty"`
+	// Cached is true when this is the Manager's last parsed G29 S0 result,
+	// served in place of a live probe (refused with ErrJobActive) while a
+	// job is running.
+	Cached bool `json:"cached,omitempty"`
 }

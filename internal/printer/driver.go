@@ -95,6 +95,8 @@ type Driver struct {
 	mu         sync.Mutex // guards the parsed state below
 	temps      Temps
 	sdStatus   SDStatus
+	position   Position
+	hasPos     bool // a Position has been parsed at least once
 	caps       map[string]bool
 	lastLines  []string // small ring buffer for the UI console
 	sdFiles    []SDFile
@@ -109,11 +111,15 @@ type Driver struct {
 	consoleTotal int64 // total lines ever recorded, guarded by mu (see ConsoleSince)
 
 	// metaFeed, when non-nil, is fed every raw source line of an SD upload
-	// (UploadToSD/uploadASCII) as it streams by, so slicer-comment metadata
-	// (Job.go's metaParser) can be parsed without buffering the file. Only
-	// the upload goroutine touches it, and only while it exclusively holds
-	// the port (see beginUpload/endUpload), so no lock is needed.
-	metaFeed func(line string)
+	// (UploadToSD/uploadASCII) as it streams by, plus the card-space byte
+	// offset through the end of that line (0 bytes for a line never
+	// written to the card, e.g. a comment or a control line stripCommand
+	// drops), so slicer-comment metadata (job.go's metaParser) can be
+	// parsed, with offsets matching what M27 "SD printing byte X/Y" later
+	// reports, without buffering the file. Only the upload goroutine
+	// touches it, and only while it exclusively holds the port (see
+	// beginUpload/endUpload), so no lock is needed.
+	metaFeed func(line string, cardOffset int64)
 
 	// wmu orders writes: a line is numbered (window.Prepare) and written
 	// under it, and resend replays/resyncs hold it, so the wire always sees
@@ -790,6 +796,14 @@ func (d *Driver) parseInfo(raw string) {
 		d.mu.Unlock()
 		return
 	}
+	if p, ok := ParsePosition(trimmed); ok {
+		d.mu.Lock()
+		p.At = time.Now()
+		d.position = p
+		d.hasPos = true
+		d.mu.Unlock()
+		return
+	}
 	if name, enabled, ok := ParseCapability(trimmed); ok {
 		d.mu.Lock()
 		d.caps[name] = enabled
@@ -866,6 +880,14 @@ func (d *Driver) SDStatus() SDStatus {
 	return d.sdStatus
 }
 
+// Position returns the last M114 position parsed, and false if none has
+// been seen yet since the driver connected.
+func (d *Driver) Position() (Position, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.position, d.hasPos
+}
+
 // Capabilities returns the M115 Cap: flags seen so far.
 func (d *Driver) Capabilities() map[string]bool {
 	d.mu.Lock()
@@ -906,6 +928,28 @@ func (d *Driver) ConsoleSince(since int64) ([]string, int64) {
 	out := make([]string, have-start)
 	copy(out, d.lastLines[start:])
 	return out, total
+}
+
+// UpsertSDFile inserts f into the cached SD listing, or replaces the
+// existing entry with the same short name, without a fresh M20 round trip.
+// Used right after an upload finishes so /gonkd/files reflects it (and its
+// metadata) immediately.
+func (d *Driver) UpsertSDFile(f SDFile) {
+	d.mu.Lock()
+	found := false
+	for i := range d.sdFiles {
+		if d.sdFiles[i].Short == f.Short {
+			d.sdFiles[i] = f
+			found = true
+			break
+		}
+	}
+	if !found {
+		d.sdFiles = append(d.sdFiles, f)
+	}
+	d.mu.Unlock()
+	d.listSeq.Add(1)
+	d.changed.fire()
 }
 
 // PatchLongName updates the long name of an already-listed file in place,

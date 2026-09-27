@@ -1,5 +1,5 @@
 // Bed: manual mesh leveling (5x5 heatmap + wizard), corner assistant, Z offset.
-import { h, icon, region, setText } from '../dom.js';
+import { h, icon, region, setText, visiblePoll } from '../dom.js';
 import { card, btn, iconBtn, seg, banner, sheet, note, spinner, empty } from '../ui.js';
 import { phaseOf, act, jobActive, connected, toast, set } from '../store.js';
 import { api } from '../api.js';
@@ -22,12 +22,25 @@ let meshLoading = false;
 let wiz = null; // null | {point,total,z} | 'done'
 let zStep = Z_STEPS[0];
 
+const MESH_READ_KEY = 'gonkd-mesh-read-at';
+function markMeshRead() {
+  try { localStorage.setItem(MESH_READ_KEY, String(Date.now())); } catch { /* private mode: this visit only */ }
+}
+function lastMeshReadText() {
+  try {
+    const v = localStorage.getItem(MESH_READ_KEY);
+    if (v) return new Date(Number(v)).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
+  } catch { /* ignore */ }
+  return 'earlier';
+}
+
 async function loadMesh() {
   meshLoading = true;
   set({});
   try {
     mesh = await api.mesh();
     meshErr = '';
+    if (mesh && mesh.points && !mesh.cached) markMeshRead();
   } catch (e) {
     meshErr = e.message || 'Could not load the mesh';
   }
@@ -55,6 +68,9 @@ export function mount(root) {
   root.append(screenTitle('Bed'), banners.el, lockNote.el,
     h('div', { class: 'control-grid' }, heat.el, wizard.el, corner.el, zoff.el));
   if (!mesh && !meshLoading) loadMesh();
+  // POST /gonkd/position while actively levelling (the coordinates panel
+  // itself lives on Control; this just keeps position fresh in that gap).
+  visiblePoll(root, 3000, () => api.position().catch(() => {}), () => !!wiz);
   return (s) => {
     banners.update(s);
     lockNote.update(s);
@@ -117,6 +133,10 @@ function heatmapCard() {
       const rangeNote = mesh.range > RANGE_WARN
         ? note('warn', `Range ${mesh.range.toFixed(3)}mm is large. Try the corner assistant before fine mesh points.`)
         : null;
+      const cachedNote = mesh.cached
+        ? banner('info', 'Cached mesh', `Last read ${lastMeshReadText()}, live view after the print.`, { icon: 'clock' })
+        : null;
+      if (cachedNote) body.append(cachedNote);
       const grid = h('div', { class: 'mesh-grid' });
       for (let y = 0; y < mesh.points.length; y++) {
         for (let x = 0; x < mesh.points[y].length; x++) {
@@ -225,7 +245,7 @@ function cornerCard() {
   }));
   const grid = h('div', { class: 'corner-grid' }, ...btns.map((b, i) => b || h('span', { key: i })));
   const done = btn('Done: lift and turn the mesh back on', {
-    onClick: () => act(() => api.bedCorner('done'), 'Mesh back on'),
+    onClick: () => act(() => api.bedCorner('done'), 'Mesh back on').then((ok) => ok && loadMesh()),
   });
   const el = card('Corner assistant', 'home', [
     h('p', { class: 'meta', text: 'Homes if needed, turns the mesh off, moves over each levelling screw, then lowers for the paper test.' }),

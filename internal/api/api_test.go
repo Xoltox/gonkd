@@ -193,6 +193,33 @@ func TestJogValidation(t *testing.T) {
 	}
 }
 
+// TestPositionDisconnectedReturns409 checks POST /gonkd/position's error
+// mapping when there is no driver; it does not require a JSON body
+// (checkMutation's requireJSON is false), unlike jog/tune/heat.
+func TestPositionDisconnectedReturns409(t *testing.T) {
+	mux := newRouter(t)
+	req := httptest.NewRequest(http.MethodPost, "http://192.0.2.10/gonkd/position", nil)
+	req.Host = "192.0.2.10"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestMeshDisconnectedReturns409NotFound checks GET /gonkd/mesh maps a
+// plain disconnect (no job, so not the cached-mesh path) the same way it
+// always has.
+func TestMeshDisconnectedReturns409(t *testing.T) {
+	mux := newRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/gonkd/mesh", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func postJSON(t *testing.T, mux *http.ServeMux, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "http://192.0.2.10"+path, strings.NewReader(body))

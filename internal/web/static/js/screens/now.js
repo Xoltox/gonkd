@@ -9,6 +9,19 @@ import { dur, clock, t1, t0, pct, bytes, displayName, DEG } from '../fmt.js';
 
 const RUNNING = ['printing', 'paused', 'heating', 'cancelling'];
 
+// Height readout mode (layer count vs Z mm), remembered per browser.
+const HEIGHT_KEY = 'gonkd-height-mode';
+function loadHeightMode() {
+  try { return localStorage.getItem(HEIGHT_KEY) === 'z' ? 'z' : 'layer'; } catch { return 'layer'; }
+}
+function saveHeightMode(m) {
+  try { localStorage.setItem(HEIGHT_KEY, m); } catch { /* private mode: this visit only */ }
+}
+
+// job.etaSource is "m73" | "slicer" | "live"; the UI only distinguishes
+// "from the file" (m73/slicer) vs "from the live pace" (live).
+const sourceHint = (src) => (src === 'live' ? 'live' : src ? 'slicer' : '');
+
 export function mount(root) {
   const banners = pageBanners();
   const job = region(jobKey, buildJob);
@@ -102,9 +115,10 @@ function runningCard(s, p, live) {
     return { el: h('div', null, h('dt', { text: label }), dd), dd };
   };
   const el = time('Elapsed');
+  const height = heightItem();
+  const left = timeHint('Left');
   const ls = time('Left (slicer)');
-  const ll = time('Left (live)');
-  const da = time('Done at');
+  const da = time('Finishes at');
   const est = f && f.meta && f.meta.estSec;
   live((s) => {
     const j = s.snap.job;
@@ -113,13 +127,18 @@ function runningCard(s, p, live) {
     big.setAttribute('aria-label', heating ? 'Heating' : `${pct(j.progress)} percent`);
     pb.set(j.progress);
     setText(el.dd, dur(j.elapsedSec));
+    const primary = j.etaSec > 0 ? j.etaSec : null;
+    setText(left.dd, primary != null ? dur(primary) : '--');
+    setText(left.hint, primary != null ? sourceHint(j.etaSource) : '');
     const leftSlicer = est ? Math.max(0, est - j.elapsedSec) : null;
-    ls.el.hidden = leftSlicer == null;
-    if (leftSlicer != null) setText(ls.dd, dur(leftSlicer));
-    const showLive = j.progress >= 5 && j.etaSec > 0;
-    setText(ll.dd, showLive ? dur(j.etaSec) : '--');
-    const left = showLive ? j.etaSec : leftSlicer;
-    setText(da.dd, left != null ? clock(Date.now() + left * 1000) : '--');
+    // Only add the slicer-file estimate back when it says something the
+    // primary (m73/live) figure does not already tell you.
+    const showSlicer = leftSlicer != null && j.etaSource !== 'slicer' && (primary == null || Math.abs(leftSlicer - primary) > Math.max(60, primary * 0.1));
+    ls.el.hidden = !showSlicer;
+    if (showSlicer) setText(ls.dd, dur(leftSlicer));
+    const finishIn = primary != null ? primary : leftSlicer;
+    setText(da.dd, finishIn != null ? clock(Date.now() + finishIn * 1000) : '--');
+    height.update(j, s.snap.position);
     const np = nextPauseInfo(j, f && f.meta);
     nextPause.hidden = !np;
     if (np) setText(nextPause, `Next pause: layer ${np.layer || '?'}, ${np.msg}${np.eta != null ? ` - about ${dur(np.eta)}` : ''}`);
@@ -134,8 +153,35 @@ function runningCard(s, p, live) {
     heating && h('p', { class: 'meta', text: 'Heating up before the first layer. The print starts on its own.' }),
     p === 'paused' && h('p', { class: 'meta' }, icon('pause', 16), ' Paused. The nozzle may ooze; resume soon or cancel.'),
     nextPause,
-    h('dl', { class: 'times' }, el.el, ls.el, ll.el, da.el),
+    h('dl', { class: 'times' }, el.el, height.el, left.el, ls.el, da.el),
   ], { class: 'job' });
+}
+
+// "Layer 45 / 120" (from job.layer/layerTotal) or "Z 9.20 mm" (job.z,
+// falling back to the live position.z). Tap to toggle; sticky per browser.
+function heightItem() {
+  let mode = loadHeightMode();
+  let lastJob = null;
+  let lastPos = null;
+  const dd = h('dd', { class: 'num-l tnum', text: '--' });
+  const el = h('button', {
+    type: 'button', class: 'time-btn',
+    'aria-label': 'Height, tap to switch between layer number and Z height',
+    onclick: () => { mode = mode === 'layer' ? 'z' : 'layer'; saveHeightMode(mode); render(); },
+  }, h('dt', { text: 'Height' }), dd);
+  function render() {
+    const j = lastJob;
+    const z = j && j.z != null ? j.z : (lastPos && lastPos.z != null ? lastPos.z : null);
+    const showLayer = mode === 'layer' && j && j.layerTotal && j.layer;
+    setText(dd, showLayer ? `Layer ${j.layer} / ${j.layerTotal}` : z != null ? `Z ${z.toFixed(2)} mm` : '--');
+  }
+  return { el, update(j, pos) { lastJob = j; lastPos = pos; render(); } };
+}
+
+function timeHint(label) {
+  const dd = h('dd', { class: 'num-l tnum', text: '--' });
+  const hint = h('span', { class: 'meta time-hint' });
+  return { el: h('div', null, h('dt', { text: label }), dd, hint), dd, hint };
 }
 
 function uploadingCard(s, live) {

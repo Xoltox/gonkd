@@ -25,6 +25,9 @@ var (
 	// ErrUnknownFile is returned by RenameFile for a short name not in the
 	// current SD listing.
 	ErrUnknownFile = errors.New("file not found")
+	// ErrNoMesh is returned by MeshReportOrCached when a job is running and
+	// no mesh has ever been successfully read since gonkd started.
+	ErrNoMesh = errors.New("no mesh available")
 )
 
 // sdStartGrace is how long an SD job may report "Not SD printing" after
@@ -99,6 +102,13 @@ type Manager struct {
 	// leveling is non-nil while a manual mesh probe (G29 S1/S2) is under
 	// way; see mesh.go.
 	leveling *Leveling
+
+	// lastPosReq rate-limits RequestPosition's M114 (see positionMinInterval).
+	lastPosReq time.Time
+
+	// lastMesh is the last successfully parsed G29 S0 result, served (with
+	// Cached set) by GET /gonkd/mesh while a job is running; see mesh.go.
+	lastMesh *Mesh
 }
 
 func NewManager(names *NameMap) *Manager {
@@ -211,6 +221,7 @@ func (m *Manager) Snapshot() Snapshot {
 	state := m.state
 	lastErr := m.lastErr
 	speed, flow, fan := m.speed, m.flow, m.fan
+	meta := m.meta
 	var job *Job
 	if m.job != nil {
 		j := *m.job
@@ -230,8 +241,24 @@ func (m *Manager) Snapshot() Snapshot {
 
 	if job != nil {
 		job.ElapsedSec = time.Since(job.StartedAt).Seconds()
-		if job.Progress > 0 && job.Progress < 100 && (state == StatePrinting || state == StateUploading) {
-			job.ETASec = job.ElapsedSec/job.Progress*100 - job.ElapsedSec
+		switch state {
+		case StateUploading:
+			if job.Progress > 0 && job.Progress < 100 {
+				job.ETASec = job.ElapsedSec/job.Progress*100 - job.ElapsedSec
+			}
+		case StatePrinting, StatePaused:
+			var jm *SDMeta
+			if meta != nil && job.short != "" {
+				jm = meta.Get(job.short)
+			}
+			applyPrintProgress(job, jm)
+		}
+	}
+	var position *Position
+	if drv != nil {
+		if p, ok := drv.Position(); ok {
+			pc := p
+			position = &pc
 		}
 	}
 	snap := Snapshot{
@@ -244,6 +271,7 @@ func (m *Manager) Snapshot() Snapshot {
 		Limits:    Limits{HotendMax: hotendMaxC, BedMax: bedMaxC},
 		UserWait:  userWait,
 		Leveling:  leveling,
+		Position:  position,
 	}
 	if drv != nil {
 		snap.Temps = drv.Temps()
@@ -359,6 +387,103 @@ func setSDProgress(j *Job, st SDStatus) {
 	if st.Total > 0 {
 		j.Progress = float64(st.Current) / float64(st.Total) * 100
 	}
+	// The first real SD byte progress marks when Marlin actually started
+	// reading the card, as opposed to StartedAt, which also covers
+	// heating; the ETA fallbacks in applyPrintProgress count elapsed time
+	// from here.
+	if j.firstByteAt.IsZero() && st.Current > 0 {
+		j.firstByteAt = time.Now()
+	}
+}
+
+// slicerPaceGate is the byte-progress fraction (contract: "after 10%")
+// past which applyPrintProgress trusts the actual/expected pace ratio to
+// scale meta.EstSec; before it, a slow start (heating, priming) would
+// throw the ratio off, so the slicer's own estimate is used as-is.
+const slicerPaceGate = 0.10
+
+// applyPrintProgress fills in job.Layer/LayerTotal/Z/ETASec/EtaSource from
+// job.SentBytes (the current card-space offset, from M27 "SD printing
+// byte X/Y" -- see setSDProgress) against meta's recorded tables. meta may
+// be nil (no stored metadata for this file, or an LCD-started job with no
+// short name at all), in which case only the byte-progress ("live") ETA
+// fallback applies.
+func applyPrintProgress(job *Job, meta *SDMeta) {
+	offset := job.SentBytes
+	if meta != nil {
+		if layer, z, ok := layerAt(meta.Layers, offset); ok {
+			job.Layer = layer
+			job.Z = z
+		}
+		job.LayerTotal = meta.LayerCount
+		if rem, ok := interpolateM73(meta.M73, offset); ok {
+			job.ETASec = rem
+			job.EtaSource = "m73"
+			return
+		}
+	}
+	if job.firstByteAt.IsZero() {
+		return
+	}
+	elapsed := time.Since(job.firstByteAt).Seconds()
+	if meta != nil && meta.EstSec > 0 && job.TotalBytes > 0 {
+		frac := float64(offset) / float64(job.TotalBytes)
+		est := float64(meta.EstSec)
+		if frac > slicerPaceGate {
+			pace := elapsed / (est * frac)
+			est *= pace
+		}
+		job.ETASec = est - elapsed
+		job.EtaSource = "slicer"
+		return
+	}
+	if job.TotalBytes > 0 && offset > 0 {
+		frac := float64(offset) / float64(job.TotalBytes)
+		job.ETASec = elapsed/frac - elapsed
+		job.EtaSource = "live"
+	}
+}
+
+// layerAt returns the 1-based layer and planned Z of the last LayerPoint
+// at or before offset, or ok=false if offset is before the first one (or
+// the table is empty).
+func layerAt(layers []LayerPoint, offset int64) (layer int, z float64, ok bool) {
+	for i, l := range layers {
+		if l.O > offset {
+			break
+		}
+		layer, z, ok = i+1, l.Z, true
+	}
+	return layer, z, ok
+}
+
+// interpolateM73 linearly interpolates the remaining seconds between the
+// two M73Points bracketing offset (clamping to the first/last entry
+// outside the table's range). ok is false only for an empty table.
+func interpolateM73(table []M73Point, offset int64) (remainingSec float64, ok bool) {
+	if len(table) == 0 {
+		return 0, false
+	}
+	if offset <= table[0].O {
+		return float64(table[0].R), true
+	}
+	last := table[len(table)-1]
+	if offset >= last.O {
+		return float64(last.R), true
+	}
+	for i := 1; i < len(table); i++ {
+		if table[i].O < offset {
+			continue
+		}
+		prev := table[i-1]
+		cur := table[i]
+		if cur.O == prev.O {
+			return float64(cur.R), true
+		}
+		frac := float64(offset-prev.O) / float64(cur.O-prev.O)
+		return float64(prev.R) + frac*float64(cur.R-prev.R), true
+	}
+	return float64(last.R), true
 }
 
 // userWaitDefaultMsg is shown when Marlin is blocked at an M0/M1 with no
@@ -660,7 +785,7 @@ func (m *Manager) runSD(ctx context.Context, drv *Driver, job *Job, localPath, l
 		mp = &metaParser{}
 		drv.metaFeed = mp.feed
 	}
-	short, err := drv.UploadToSD(ctx, localPath, longName, m.Names, func(sent, total int64) {
+	short, cardBytes, err := drv.UploadToSD(ctx, localPath, longName, m.Names, func(sent, total int64) {
 		m.mu.Lock()
 		if m.job == job {
 			job.SentBytes = sent
@@ -682,15 +807,24 @@ func (m *Manager) runSD(ctx context.Context, drv *Driver, job *Job, localPath, l
 		// Non-fatal: the file is on the card, only the long name is lost.
 		log.Printf("gonkd: saving name map: %v", err)
 	}
+	// Insert/update the listing directly (contract #1): the printer's own
+	// M20 L is comparatively slow and, before this, gonkd only ever asked
+	// for one when startPrint was false, so a file uploaded and started
+	// right away never showed up in /gonkd/files until some other refresh.
+	drv.UpsertSDFile(SDFile{Short: short, Long: longName, Bytes: cardBytes})
 	if mp != nil {
 		meta, png := mp.result()
 		if err := m.meta.Save(short, meta, png); err != nil {
 			log.Printf("gonkd: saving metadata for %s: %v", short, err)
 		}
 	}
+	m.mu.Lock()
+	if m.job == job {
+		job.short = short
+	}
+	m.mu.Unlock()
 	if !startPrint {
 		m.finishJob(job)
-		_ = drv.RefreshFiles()
 		return
 	}
 
@@ -703,6 +837,7 @@ func (m *Manager) runSD(ctx context.Context, drv *Driver, job *Job, localPath, l
 	}
 	job.SentBytes, job.TotalBytes, job.Progress = 0, 0, 0
 	job.StartedAt = time.Now()
+	job.firstByteAt = time.Time{}
 	m.sdSeen = false
 	m.state = StatePrinting
 	m.mu.Unlock()
@@ -1091,12 +1226,57 @@ func (m *Manager) SendSequence(cmds []string) error {
 			}
 		}
 	}
+	homed := false
 	for _, c := range cmds {
 		if err := drv.Send(c); err != nil {
 			return err
 		}
+		if isHome(c) {
+			homed = true
+		}
+	}
+	if homed {
+		// Best-effort: a fresh position after a home is a nicety, not
+		// something the caller needs to see fail.
+		_ = m.RequestPosition()
 	}
 	return nil
+}
+
+// isHome reports whether cmd is a G28 (home), the trigger (along with jog
+// and corner/mesh moves, handled at their own call sites) for an automatic
+// M114 refresh of Snapshot's position.
+func isHome(cmd string) bool {
+	f := strings.Fields(strings.ToUpper(cmd))
+	return len(f) > 0 && f[0] == "G28"
+}
+
+// positionMinInterval rate-limits RequestPosition: repeated calls within
+// this window (the UI's own 3s poll, plus the automatic refresh after
+// every jog/home/corner/mesh-zadjust) are silent no-ops rather than
+// errors, since this is a best-effort refresh, not a mutation the caller
+// must see succeed.
+const positionMinInterval = 1 * time.Second
+
+// RequestPosition sends M114; the reply is parsed automatically
+// (Driver.parseInfo/ParsePosition) and shows up in the next Snapshot.
+// Unlike SendSequence it is never refused while a job is active (R-05
+// only guards motion/positioning-mode/EEPROM commands, and M114 is none
+// of those).
+func (m *Manager) RequestPosition() error {
+	drv := m.driver()
+	if drv == nil {
+		return ErrDisconnected
+	}
+	m.mu.Lock()
+	now := time.Now()
+	if now.Sub(m.lastPosReq) < positionMinInterval {
+		m.mu.Unlock()
+		return nil
+	}
+	m.lastPosReq = now
+	m.mu.Unlock()
+	return drv.Send("M114")
 }
 
 // unsafeDuringJob reports whether cmd moves axes, changes positioning or
@@ -1195,10 +1375,23 @@ func (m *Manager) SDFiles() []SDFile {
 	files := drv.SDFiles()
 	if m.meta != nil {
 		for i := range files {
-			files[i].Meta = m.meta.Get(files[i].Short)
+			files[i].Meta = trimmedMeta(m.meta.Get(files[i].Short))
 		}
 	}
 	return files
+}
+
+// trimmedMeta returns meta with its Layers/M73 tables cleared: they are
+// only ever used server-side (Manager.applyPrintProgress) and are large
+// enough (up to 3000/1000 entries) that /gonkd/files must not send them.
+func trimmedMeta(meta *SDMeta) *SDMeta {
+	if meta == nil || (meta.Layers == nil && meta.M73 == nil) {
+		return meta
+	}
+	m := *meta
+	m.Layers = nil
+	m.M73 = nil
+	return &m
 }
 
 // activeDriver returns the driver when no job runs.

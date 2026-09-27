@@ -22,10 +22,10 @@ const TYPES = {
 // ---- simulated printer ----
 const LIMITS = { hotendMax: 260, bedMax: 110 };
 let files = [
-  { short: 'BENCHY~1.GCO', long: 'benchy_0.2mm_PLA.gcode', bytes: 2841233, meta: { thumb: true, estSec: 5220, filamentG: 14.8, filamentMm: 4960, layerHeight: 0.2, nozzle: 0.4, hotendC: 205, bedC: 60, slicer: 'OrcaSlicer 2.2.0',
+  { short: 'BENCHY~1.GCO', long: 'benchy_0.2mm_PLA.gcode', bytes: 2841233, meta: { thumb: true, estSec: 5220, filamentG: 14.8, filamentMm: 4960, layerHeight: 0.2, layerCount: 120, nozzle: 0.4, hotendC: 205, bedC: 60, slicer: 'OrcaSlicer 2.2.0',
     pauses: [{ offset: 1500000, layer: 40, cmd: 'M600', msg: 'Color change to red' }], unsupported: ['M600'] } },
-  { short: 'CALCUB~1.GCO', long: 'calibration_cube_20mm.gcode', bytes: 512330, meta: { thumb: true, estSec: 1860, filamentG: 6.1, layerHeight: 0.2, nozzle: 0.4, hotendC: 200, bedC: 60, slicer: 'PrusaSlicer 2.8.1' } },
-  { short: 'CABLEC~1.GCO', long: 'cable_clip_x8_PETG_long_name_that_wraps_on_small_phones.gcode', bytes: 1203880, meta: { estSec: 3420, filamentG: 9.4, layerHeight: 0.16, nozzle: 0.4, hotendC: 235, bedC: 80 } },
+  { short: 'CALCUB~1.GCO', long: 'calibration_cube_20mm.gcode', bytes: 512330, meta: { thumb: true, estSec: 1860, filamentG: 6.1, layerHeight: 0.2, layerCount: 60, nozzle: 0.4, hotendC: 200, bedC: 60, slicer: 'PrusaSlicer 2.8.1' } },
+  { short: 'CABLEC~1.GCO', long: 'cable_clip_x8_PETG_long_name_that_wraps_on_small_phones.gcode', bytes: 1203880, meta: { estSec: 3420, filamentG: 9.4, layerHeight: 0.16, layerCount: 90, nozzle: 0.4, hotendC: 235, bedC: 80 } },
   { short: 'TEST.GCO', long: '', bytes: 4096 },
 ];
 let presets = [{ name: 'PLA', hotend: 200, bed: 60 }, { name: 'PETG', hotend: 235, bed: 80 }];
@@ -53,10 +53,14 @@ function randomMesh() {
   }
   return pts;
 }
+// Simulated live position (X/Y/Z/E), as if kept up to date by M114 replies.
+let pos = { x: 0, y: 0, z: 0, e: 0 };
+const touchPosition = () => { p.position = { ...pos, at: new Date().toISOString() }; };
+
 const p = {
   state: 'idle', connected: true,
   temps: { HotendActual: 24.1, HotendTarget: 0, BedActual: 23.4, BedTarget: 0, FanPercent: 0 },
-  job: null, tune: { speed: 100, flow: 100, fan: 0 }, userWait: null,
+  job: null, tune: { speed: 100, flow: 100, fan: 0 }, userWait: null, position: null,
   capabilities: ['AUTOREPORT_TEMP', 'AUTOREPORT_SD_STATUS', 'EEPROM', 'EMERGENCY_PARSER', 'SDCARD', 'LONG_FILENAME', 'BABYSTEPPING', 'PROMPT_SUPPORT', 'THERMAL_PROTECTION'],
   lastError: '', version: '0.1.0-dev', firmware: 'Marlin 2.1.2.7', limits: LIMITS,
 };
@@ -74,7 +78,20 @@ const say = (line) => emit('console', { line, ts: Date.now() });
 const pushStatus = () => emit('status', snapshot());
 
 function newJob(f) {
-  return { filename: f.short, mode: 'sd', totalBytes: f.bytes, sentBytes: 0, progress: 0, startedAt: new Date().toISOString(), elapsedSec: 0, etaSec: 0, babystepMm: 0 };
+  return {
+    filename: f.short, mode: 'sd', totalBytes: f.bytes, sentBytes: 0, progress: 0, startedAt: new Date().toISOString(),
+    elapsedSec: 0, etaSec: 0, babystepMm: 0,
+    layerTotal: (f.meta && f.meta.layerCount) || 0, layer: 0, z: 0,
+    etaSource: f.meta && f.meta.layerCount ? 'm73' : 'live',
+  };
+}
+
+// Keeps job.layer/z in step with progress, as if read from the layer table.
+function syncLayer(f) {
+  if (!p.job || !f.meta || !f.meta.layerCount) return;
+  p.job.layerTotal = f.meta.layerCount;
+  p.job.layer = Math.max(1, Math.min(f.meta.layerCount, Math.round((p.job.progress / 100) * f.meta.layerCount)));
+  p.job.z = Math.round(p.job.layer * (f.meta.layerHeight || 0.2) * 1000) / 1000;
 }
 function startPrint(f) {
   p.state = 'printing';
@@ -108,6 +125,7 @@ setInterval(() => {
       p.job.elapsedSec += 30;
       p.job.sentBytes = Math.round(p.job.totalBytes * p.job.progress / 100);
       p.job.etaSec = p.job.progress > 1 ? (p.job.elapsedSec / p.job.progress) * (100 - p.job.progress) : 0;
+      syncLayer(findFile(p.job.filename) || {});
       if (tick % 4 === 0) say(`SD printing byte ${p.job.sentBytes}/${p.job.totalBytes}`);
       if (p.job.progress >= 100) {
         p.state = 'idle';
@@ -145,7 +163,13 @@ function scenario(s) {
   switch (s) {
     case 'idle': p.state = 'idle'; reset(); break;
     case 'heating': startPrint(f); p.temps.HotendActual = 60; p.temps.BedActual = 30; break;
-    case 'printing': startPrint(f); Object.assign(p.temps, { HotendActual: 205, BedActual: 60 }); Object.assign(p.job, { progress: 42.3, elapsedSec: 2210, etaSec: 3010, babystepMm: -0.02 }); break;
+    case 'printing':
+      startPrint(f);
+      Object.assign(p.temps, { HotendActual: 205, BedActual: 60 });
+      Object.assign(p.job, { progress: 42.3, elapsedSec: 2210, etaSec: 3010, babystepMm: -0.02 });
+      syncLayer(f);
+      touchPosition();
+      break;
     case 'paused': scenario('printing'); p.state = 'paused'; break;
     case 'finished': p.state = 'idle'; p.job = { ...newJob(f), progress: 100, elapsedSec: 5301 }; p.temps.HotendTarget = 0; p.temps.BedTarget = 0; break;
     case 'error': p.state = 'error'; p.lastError = 'Printer reported: Error:Thermal Runaway, system stopped! Heater_ID: 0'; break;
@@ -199,7 +223,10 @@ async function api(req, res, url) {
     res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'max-age=86400' });
     return res.end(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="#2a2621"/><path d="M14 44h36l-6-16H22z" fill="hsl(${hue} 70% 55%)"/><rect x="26" y="18" width="12" height="10" fill="hsl(${hue} 70% 45%)"/></svg>`);
   }
-  if (path === '/gonkd/mesh' && req.method === 'GET') return json(res, 200, meshView());
+  if (path === '/gonkd/mesh' && req.method === 'GET') {
+    if (!mesh.points) return fail(res, 404, 'no mesh yet');
+    return json(res, 200, busy() ? { ...meshView(), cached: true } : meshView());
+  }
   if (path === '/gonkd/presets' && req.method === 'GET') return json(res, 200, presets);
   if (path === '/gonkd/presets' && req.method === 'PUT') {
     const list = j();
@@ -214,7 +241,13 @@ async function api(req, res, url) {
       const cmd = String(j().cmd || '').trim().toUpperCase();
       if (!cmd) return fail(res, 400, 'bad request');
       setTimeout(() => {
-        if (cmd.startsWith('M114')) say('X:0.00 Y:0.00 Z:10.00 E:0.00 Count X:0 Y:0 Z:4000');
+        if (/^G28\b/.test(cmd)) {
+          const axes = cmd.replace('G28', '').trim();
+          const list = axes ? axes.split(/\s+/).map((a) => a[0].toLowerCase()) : ['x', 'y', 'z'];
+          for (const a of list) if (pos[a] != null) pos[a] = 0;
+          touchPosition();
+        }
+        if (cmd.startsWith('M114')) { touchPosition(); say(`X:${pos.x.toFixed(2)} Y:${pos.y.toFixed(2)} Z:${pos.z.toFixed(2)} E:${pos.e.toFixed(2)} Count X:0 Y:0 Z:4000`); }
         else if (cmd.startsWith('M115')) say('FIRMWARE_NAME:Marlin 2.1.2.7 (Sep 20 2026) PROTOCOL_VERSION:1.0 MACHINE_TYPE:Ender-3 4.2.2 EXTRUDER_COUNT:1');
         else if (cmd.startsWith('M105')) say(`ok T:${p.temps.HotendActual.toFixed(2)} /${p.temps.HotendTarget.toFixed(2)} B:${p.temps.BedActual.toFixed(2)} /${p.temps.BedTarget.toFixed(2)} @:0 B@:0`);
         else if (cmd.startsWith('M503')) { say('echo:  G21    ; Units in mm (mm)'); say('echo:  M92 X80.00 Y80.00 Z400.00 E93.00'); }
@@ -260,7 +293,14 @@ async function api(req, res, url) {
     case '/gonkd/jog': {
       if (busy()) return fail(res, 409, 'move disabled while a job is active');
       const b = j();
+      const axis = String(b.axis || '').toLowerCase();
+      if (pos[axis] != null) pos[axis] = Math.round((pos[axis] + Number(b.dist || 0)) * 1000) / 1000;
+      touchPosition();
       say(`echo:G91 G1 ${b.axis}${b.dist} F${b.feed} G90`); say('ok');
+      return done(res);
+    }
+    case '/gonkd/position': {
+      touchPosition();
       return done(res);
     }
     case '/gonkd/heat': {
@@ -314,6 +354,7 @@ async function api(req, res, url) {
       if (!leveling) return fail(res, 400, 'not levelling');
       const mm = Math.max(-1, Math.min(1, j().mm || 0));
       leveling.z += mm;
+      touchPosition();
       return json(res, 200, { z: leveling.z });
     }
     case '/gonkd/mesh/zoffset': {
@@ -333,7 +374,12 @@ async function api(req, res, url) {
     }
     case '/gonkd/bed/corner': {
       if (busy()) return fail(res, 409, 'a job is already active');
-      if (!['fl', 'fr', 'bl', 'br', 'center'].includes(j().corner)) return fail(res, 400, 'bad corner');
+      const c = j().corner;
+      if (!['fl', 'fr', 'bl', 'br', 'center', 'done'].includes(c)) return fail(res, 400, 'bad corner');
+      const CORNER_XY = { bl: [10, 10], br: [190, 10], fl: [10, 190], fr: [190, 190], center: [100, 100] };
+      if (CORNER_XY[c]) { [pos.x, pos.y] = CORNER_XY[c]; pos.z = 0.2; }
+      if (c === 'done') mesh.active = true;
+      touchPosition();
       return done(res);
     }
     case '/api/files/local': {

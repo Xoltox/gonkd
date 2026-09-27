@@ -79,3 +79,24 @@ export function toggle(el, cls, on) {
 
 let uid = 0;
 export const nextId = (p = 'u') => p + ++uid;
+
+// Poll fn() every ms while root is attached to the document, the tab is
+// visible (document.visibilityState), and active() is true (default:
+// always). Fires once immediately if those hold. Cleans itself up once
+// root leaves the DOM (the router swaps screens by replacing children).
+export function visiblePoll(root, ms, fn, active = () => true) {
+  const ok = () => root.isConnected && document.visibilityState === 'visible' && active();
+  let timer = 0;
+  function stop() {
+    clearInterval(timer);
+    document.removeEventListener('visibilitychange', onVis);
+  }
+  function tick() {
+    if (!root.isConnected) { stop(); return; }
+    if (ok()) fn();
+  }
+  function onVis() { tick(); }
+  tick();
+  timer = setInterval(tick, ms);
+  document.addEventListener('visibilitychange', onVis);
+}

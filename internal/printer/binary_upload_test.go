@@ -284,10 +284,10 @@ func TestBinaryUploadExactContentUnderFaults(t *testing.T) {
 		})
 		path, want, lines := binTestFile(t, 3000, seed)
 		var fed int
-		d.metaFeed = func(string) { fed++ }
+		d.metaFeed = func(string, int64) { fed++ }
 		names := NewNameMap(t.TempDir() + "/names.json")
 		var last int64
-		short, err := d.UploadToSD(context.Background(), path, "part.gcode", names, func(s, _ int64) { last = s })
+		short, _, err := d.UploadToSD(context.Background(), path, "part.gcode", names, func(s, _ int64) { last = s })
 		if err != nil {
 			t.Fatalf("seed %d: %v", seed, err)
 		}
@@ -324,7 +324,7 @@ func TestBinaryUploadCancelAbortsAndDeletes(t *testing.T) {
 	names := NewNameMap(t.TempDir() + "/names.json")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, err := d.UploadToSD(ctx, path, "part.gcode", names, func(s, _ int64) {
+	_, _, err := d.UploadToSD(ctx, path, "part.gcode", names, func(s, _ int64) {
 		if s > 20000 {
 			cancel()
 		}
@@ -351,7 +351,7 @@ func TestBinaryUploadSilentPrinterNoFallback(t *testing.T) {
 	d, fm := startBinDriver(t, ProtoAuto, 5, func(f *binFake) { f.mute = true })
 	path, _, _ := binTestFile(t, 10, 5)
 	start := time.Now()
-	_, err := d.UploadToSD(context.Background(), path, "part.gcode", NewNameMap(t.TempDir()+"/n.json"), nil)
+	_, _, err := d.UploadToSD(context.Background(), path, "part.gcode", NewNameMap(t.TempDir()+"/n.json"), nil)
 	if err == nil || !errors.Is(err, binprotocol.ErrTimeout) {
 		t.Fatalf("err = %v", err)
 	}
@@ -378,7 +378,7 @@ func TestBinaryAutoFallsBackToASCII(t *testing.T) {
 	if err := os.WriteFile(path, []byte("G28 ; home\nG1 X1\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	short, err := d.UploadToSD(context.Background(), path, "x.gcode", NewNameMap(dir+"/n.json"), nil)
+	short, _, err := d.UploadToSD(context.Background(), path, "x.gcode", NewNameMap(dir+"/n.json"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

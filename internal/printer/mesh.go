@@ -1,7 +1,9 @@
 package printer
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strings"
 	"time"
@@ -69,7 +71,44 @@ func (m *Manager) MeshReport() (Mesh, error) {
 		mesh.Min, mesh.Max = meshMinMax(points)
 		mesh.Range = mesh.Max - mesh.Min
 	}
+	m.mu.Lock()
+	cached := mesh
+	m.lastMesh = &cached
+	m.mu.Unlock()
 	return mesh, nil
+}
+
+// MeshReportOrCached is what GET /gonkd/mesh calls: MeshReport, but while a
+// job is running (refused with ErrJobActive) it falls back to the last
+// mesh successfully parsed, with Cached set, instead of erroring; ErrNoMesh
+// if there has never been one.
+func (m *Manager) MeshReportOrCached() (Mesh, error) {
+	mesh, err := m.MeshReport()
+	if err == nil {
+		return mesh, nil
+	}
+	if !errors.Is(err, ErrJobActive) {
+		return Mesh{}, err
+	}
+	m.mu.Lock()
+	cached := m.lastMesh
+	m.mu.Unlock()
+	if cached == nil {
+		return Mesh{}, ErrNoMesh
+	}
+	out := *cached
+	out.Cached = true
+	return out, nil
+}
+
+// refreshMeshCache re-reads the mesh (G29 S0) and updates the cache after
+// an action that can change it (mesh finish/save, zoffset, point edit,
+// corner done). Best-effort: a failure here does not fail the caller's own
+// action, which has already succeeded.
+func (m *Manager) refreshMeshCache() {
+	if _, err := m.MeshReport(); err != nil {
+		log.Printf("gonkd: mesh cache refresh: %v", err)
+	}
 }
 
 func meshMinMax(points [][]float64) (min, max float64) {
@@ -176,10 +215,16 @@ func (m *Manager) MeshLevelFinish(save bool) error {
 	m.mu.Lock()
 	m.leveling = nil
 	m.mu.Unlock()
+	var err error
 	if !save {
-		return m.meshSendSequence([]string{"G29 S5"}, meshCmdTimeout)
+		err = m.meshSendSequence([]string{"G29 S5"}, meshCmdTimeout)
+	} else {
+		err = m.meshSendSequence([]string{"M420 S1", "M500"}, meshCmdTimeout)
 	}
-	return m.meshSendSequence([]string{"M420 S1", "M500"}, meshCmdTimeout)
+	if err == nil {
+		m.refreshMeshCache()
+	}
+	return err
 }
 
 // MeshZAdjust nudges Z by deltaMM during leveling (a plain G1, not part of
@@ -238,7 +283,11 @@ func (m *Manager) MeshZOffset(z float64, save bool) error {
 	if save {
 		cmds = append(cmds, "M500")
 	}
-	return m.meshSendSequence(cmds, meshCmdTimeout)
+	err := m.meshSendSequence(cmds, meshCmdTimeout)
+	if err == nil {
+		m.refreshMeshCache()
+	}
+	return err
 }
 
 // MeshSetPoint edits one mesh cell (G29 S3 Xi Yj Zz), optionally saving.
@@ -250,7 +299,11 @@ func (m *Manager) MeshSetPoint(x, y int, z float64, save bool) error {
 	if save {
 		cmds = append(cmds, "M500")
 	}
-	return m.meshSendSequence(cmds, meshCmdTimeout)
+	err := m.meshSendSequence(cmds, meshCmdTimeout)
+	if err == nil {
+		m.refreshMeshCache()
+	}
+	return err
 }
 
 // Corner is one of the five bed-corner assistant targets.
@@ -295,7 +348,15 @@ func cornerXY(c Corner) (x, y float64, ok bool) {
 // like every mesh/bed route.
 func (m *Manager) BedCorner(c Corner) error {
 	if c == CornerDone {
-		return m.meshSendSequence([]string{"G1 Z5 F600", "M420 S1"}, 30*time.Second)
+		// No G28 here, so SendSequence's own homed-triggered M114 does not
+		// fire; ask for a fresh position explicitly (contract: after every
+		// corner move, done included).
+		err := m.meshSendSequence([]string{"G1 Z5 F600", "M420 S1"}, 30*time.Second)
+		if err == nil {
+			_ = m.RequestPosition()
+			m.refreshMeshCache()
+		}
+		return err
 	}
 	x, y, ok := cornerXY(c)
 	if !ok {
