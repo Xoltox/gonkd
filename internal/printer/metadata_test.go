@@ -305,3 +305,22 @@ func TestMetaPauseMessageIgnoresComment(t *testing.T) {
 		t.Fatalf("pauses = %+v", m.Pauses)
 	}
 }
+
+func TestMetaStorePrune(t *testing.T) {
+	s := NewMetaStore(t.TempDir())
+	for _, n := range []string{"KEEP.GCO", "GONE.GCO"} {
+		if err := s.Save(n, SDMeta{EstSec: 1}, []byte("png")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Prune(map[string]bool{"KEEP.GCO": true})
+	if s.Get("KEEP.GCO") == nil {
+		t.Fatal("kept file lost its metadata")
+	}
+	if s.Get("GONE.GCO") != nil {
+		t.Fatal("metadata for a deleted file survived")
+	}
+	if _, ok := s.ThumbPath("GONE.GCO"); ok {
+		t.Fatal("thumbnail for a deleted file survived")
+	}
+}

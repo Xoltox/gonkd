@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -68,6 +69,8 @@ type Manager struct {
 	Names *NameMap
 
 	seq sync.Mutex // one command sequence at a time (SEC-8)
+
+	prunedSeq atomic.Uint64 // listing sequence the MetaStore was last pruned against
 
 	mu        sync.Mutex
 	drv       *Driver // nil while disconnected
@@ -1376,6 +1379,14 @@ func (m *Manager) SDFiles() []SDFile {
 	if m.meta != nil {
 		for i := range files {
 			files[i].Meta = trimmedMeta(m.meta.Get(files[i].Short))
+		}
+		// Once per new listing, drop metadata for files no longer on the card.
+		if seq := drv.listSeq.Load(); len(files) > 0 && m.prunedSeq.Swap(seq) != seq {
+			keep := make(map[string]bool, len(files))
+			for _, f := range files {
+				keep[f.Short] = true
+			}
+			m.meta.Prune(keep)
 		}
 	}
 	return files

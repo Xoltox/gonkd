@@ -582,6 +582,30 @@ func (s *MetaStore) Delete(short string) {
 	os.Remove(s.pngPath(short))
 }
 
+// Prune removes metadata and thumbnails whose file is no longer on the card
+// (deleted from the LCD, another host, or a different card), so flash only
+// holds data for files that exist. keep holds the short names in the latest
+// listing; callers skip pruning on an empty listing (no card, or a failed
+// M20) so a missing card does not wipe everything.
+func (s *MetaStore) Prune(keep map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		ext := filepath.Ext(name)
+		if e.IsDir() || (ext != ".json" && ext != ".png") {
+			continue
+		}
+		if short := strings.TrimSuffix(name, ext); !keep[short] {
+			os.Remove(filepath.Join(s.dir, name))
+		}
+	}
+}
+
 // evictLocked removes the least-recently-written files until the directory
 // is back under metaCapBytes. Called with mu held.
 func (s *MetaStore) evictLocked() {
