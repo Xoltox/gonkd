@@ -356,21 +356,55 @@ body:has(.has-actionbar) .toast-host { bottom: calc(var(--nav-h) + var(--bar-h) 
 .heat-row .btn { flex: none; }
 
 /* ---- bed ---- */
+.mesh-view-toggle { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.mesh-view-toggle .seg { min-width: 108px; }
+.mesh-view-toggle .btn-icon { flex: none; }
 .mesh-stats { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 10px; }
+.mesh-stage {
+  position: relative; max-width: 360px; aspect-ratio: 1; margin: 0 auto;
+}
+.mesh-2d-layer, .mesh-3d-layer {
+  position: absolute; inset: 0; transition: opacity .2s ease, transform .4s ease;
+}
+/* The 2D grid tilts into the same dimetric view the SVG draws (turn 45deg,
+   lay back 60deg: height halves; scale .707 so the diamond's width equals
+   the grid's), then hands over to the SVG with a short crossfade. */
+.mesh-2d-layer { transform-origin: 50% 50%; }
+.mesh-3d-layer { display: flex; align-items: center; justify-content: center; }
+.mesh-3d-layer > svg { position: absolute; inset: 0; margin: auto; }
+.mesh-stage.is-3d .mesh-2d-layer {
+  opacity: 0; transform: scale(.707) rotateX(60deg) rotateZ(45deg); pointer-events: none;
+  transition: opacity .15s ease .25s, transform .4s ease;
+}
+.mesh-stage.is-2d .mesh-3d-layer { opacity: 0; pointer-events: none; transition: opacity .15s ease; }
+.mesh-stage.is-3d .mesh-3d-layer { transition: opacity .2s ease .25s; }
+.mesh-svg-out { animation: mesh-out .35s ease forwards; }
+.mesh-svg-in { animation: mesh-in .35s ease; }
+@keyframes mesh-out { to { opacity: 0; transform: rotate(-20deg) scale(.9); } }
+@keyframes mesh-in { from { opacity: 0; transform: rotate(20deg) scale(.9); } }
+@media (prefers-reduced-motion: reduce) {
+  .mesh-2d-layer, .mesh-3d-layer, .mesh-stage.is-3d .mesh-2d-layer, .mesh-stage.is-3d .mesh-3d-layer { transition: none; }
+  .mesh-svg-out, .mesh-svg-in { animation: none; }
+}
 .mesh-grid {
   display: grid; grid-template-columns: repeat(var(--cols, 5), 1fr); gap: 4px;
-  aspect-ratio: 1; max-width: 360px; margin: 0 auto;
+  width: 100%; height: 100%;
 }
 .mesh-cell {
   display: flex; align-items: center; justify-content: center; border: 1px solid var(--border);
   border-radius: 4px; font-size: .8125rem; color: var(--text-1); min-height: 0; padding: 0;
 }
 .mesh-cell:disabled { opacity: .85; }
+.mesh-3d { width: 100%; height: 100%; display: block; }
+.mesh-3d-face { stroke: rgb(120 112 100 / .55); stroke-width: .75; stroke-linejoin: round; }
+.mesh-3d-base { fill: none; stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+.mesh-3d-stem { stroke: var(--border-strong); stroke-width: 1; }
+.mesh-3d-dot { stroke: rgb(0 0 0 / .3); stroke-width: .5; }
 .mesh-front { text-align: center; margin: 4px auto 0; max-width: 360px; }
+.mesh-height-note { text-align: center; margin: 2px auto 0; max-width: 360px; }
 .mesh-legend { display: flex; align-items: center; gap: 8px; max-width: 360px; margin: 8px auto 0; }
 .mesh-legend-bar {
   flex: 1; height: 10px; border-radius: 5px; border: 1px solid var(--border);
-  background: linear-gradient(to right, color-mix(in oklab, #f4eee6 8%, #1c1916), color-mix(in oklab, #f4eee6 92%, #1c1916));
 }
 .wizard-z { display: flex; align-items: baseline; gap: 4px; justify-content: center; margin: 8px 0; }
 .wizard-z .num-l { font-size: 2rem; }

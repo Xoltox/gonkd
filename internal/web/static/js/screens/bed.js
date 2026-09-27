@@ -22,6 +22,61 @@ let meshLoading = false;
 let wiz = null; // null | {point,total,z} | 'done'
 let zStep = Z_STEPS[0];
 
+// Shared colour ramp for the mesh: low = dark and cool, high = light and
+// warm. Used by the 2D cells, the 3D faces and the legend bar so all three
+// always agree. t is 0..1 (0 = min, 1 = max).
+function meshColor(t) {
+  const pct = Math.round(Math.max(0, Math.min(1, t)) * 100);
+  return `color-mix(in oklch shorter hue, #fdc58a ${pct}%, #16264d)`;
+}
+// Text colour to put on top of meshColor(t): light on the dark (low) half,
+// dark on the light (high) half.
+const meshTextColor = (t) => (t >= 0.5 ? '#1c1916' : '#f4eee6');
+// A multi-stop CSS gradient built from meshColor so the legend bar traces
+// the same oklch path instead of a naive 2-stop blend.
+function meshLegendGradient(steps = 10) {
+  const stops = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    stops.push(`${meshColor(t)} ${Math.round(t * 100)}%`);
+  }
+  return `linear-gradient(to right, ${stops.join(', ')})`;
+}
+
+const MESH_VIEW_KEY = 'gonkd-mesh-view';
+function loadMeshView() {
+  try { return localStorage.getItem(MESH_VIEW_KEY) === '3d' ? '3d' : '2d'; } catch { return '2d'; }
+}
+function saveMeshView(v) {
+  try { localStorage.setItem(MESH_VIEW_KEY, v); } catch { /* private mode: this visit only */ }
+}
+let meshView = loadMeshView(); // '2d' | '3d'
+let meshRotation = 0; // 0..3, quarter turns applied to the 3D view
+
+// Rotate a rows x cols matrix 90 degrees clockwise.
+function rotateMatrix90(m) {
+  const rows = m.length, cols = m[0].length;
+  const out = [];
+  for (let c = 0; c < cols; c++) {
+    const row = [];
+    for (let r = rows - 1; r >= 0; r--) row.push(m[r][c]);
+    out.push(row);
+  }
+  return out;
+}
+// nearestEdge names the bed side drawn at the bottom. The 2D grid never
+// rotates. In 3D, row 0 of the rotated matrix is drawn nearest, and each
+// clockwise turn brings the next side there: front, left, back, right.
+function nearestEdge() {
+  if (meshView !== '3d') return 'Front of bed';
+  return ['Front', 'Left side', 'Back', 'Right side'][((meshRotation % 4) + 4) % 4] + ' of bed';
+}
+function rotatedMesh(m, times) {
+  let r = m;
+  for (let i = 0; i < ((times % 4) + 4) % 4; i++) r = rotateMatrix90(r);
+  return r;
+}
+
 const MESH_READ_KEY = 'gonkd-mesh-read-at';
 function markMeshRead() {
   try { localStorage.setItem(MESH_READ_KEY, String(Date.now())); } catch { /* private mode: this visit only */ }
@@ -84,19 +139,126 @@ export function mount(root) {
 function heatmapCard() {
   const body = h('div', { class: 'mesh-body' });
   const editSheet = sheet('Edit point');
-  const el = card('Mesh', 'layers', [body]);
-  // Monochrome ramp: dark = low, light = high, the way a relief map reads.
-  // Fixed colours (not theme tokens) so both themes read the same way.
+  let lastState = null;
+  const viewSeg = seg('Mesh view', [['2d', '2D'], ['3d', '3D']], meshView, (v) => {
+    meshView = v;
+    saveMeshView(v);
+    applyView();
+  });
+  const rotateBtn = iconBtn('refresh', 'Rotate 3D view', () => {
+    meshRotation = (meshRotation + 1) % 4;
+    spin();
+  });
+  const headExtra = h('div', { class: 'mesh-view-toggle' }, viewSeg, rotateBtn);
+  const el = card('Mesh', 'layers', [body], { extra: headExtra });
+  // Live parts of the drawn mesh, kept so the 2D/3D toggle and rotate can
+  // change them in place: a rebuilt element starts in its end state and the
+  // browser has nothing to animate.
+  let ui = null; // {stage, layer3d, svg, edge, height, key}
+  function applyView() {
+    rotateBtn.hidden = meshView !== '3d';
+    if (!ui) return;
+    ui.stage.classList.toggle('is-3d', meshView === '3d');
+    ui.stage.classList.toggle('is-2d', meshView !== '3d');
+    setText(ui.edge, nearestEdge());
+    ui.height.hidden = meshView !== '3d' || !ui.height.textContent;
+  }
+  function spin() {
+    if (!ui || !mesh) return;
+    const all = mesh.points.flat();
+    const mn = Math.min(...all);
+    const { svg } = build3D(rotatedMesh(mesh.points, meshRotation), mn, Math.max(...all) - mn);
+    const old = ui.svg;
+    old.classList.add('mesh-svg-out');
+    svg.classList.add('mesh-svg-in');
+    ui.layer3d.append(svg);
+    ui.svg = svg;
+    setTimeout(() => old.remove(), 400);
+    setText(ui.edge, nearestEdge());
+  }
+  // Fixed (not theme-token) colours so both themes read the ramp the same
+  // way: cool and dark at the low end, warm and light at the high end.
   function cellStyle(v) {
     if (!mesh) return {};
     const all = mesh.points.flat();
     const mn = Math.min(...all), span = Math.max(...all) - mn;
     const t = span > 0 ? (v - mn) / span : 0.5;
-    const pct = Math.round(8 + t * 84); // keep both ends off pure black/white
-    return {
-      background: `color-mix(in oklab, #f4eee6 ${pct}%, #1c1916)`,
-      color: t >= 0.5 ? '#1c1916' : '#f4eee6',
-    };
+    return { background: meshColor(t), color: meshTextColor(t) };
+  }
+  // Isometric 3D surface. Row 0 of `matrix` is drawn nearest the viewer
+  // (bottom of the drawing), matching the 2D grid's "front at the bottom".
+  // Rotating the mesh matrix itself (rather than the projection) means the
+  // same draw logic always keeps the current front row at the near edge.
+  function build3D(matrix, mn, span) {
+    const rows = matrix.length, cols = matrix[0].length;
+    const halfW = 18, halfH = 9;
+    const range = span > 0 ? span : 0;
+    // Plane's own vertical extent (ignoring height), used to size the
+    // exaggeration so the height reads clearly without swamping the shape.
+    const planeSpan = (rows - 1 + cols - 1) * halfH || halfH;
+    const heightScale = range > 0 ? (0.25 * planeSpan) / range : 0;
+    // Exaggeration relative to one grid step's own screen size (scale-
+    // invariant: both are computed before the final viewBox fit).
+    const exaggeration = heightScale > 0 ? heightScale / halfH : 0;
+    const pts = [];
+    for (let i = 0; i < rows; i++) {
+      const row = [];
+      for (let j = 0; j < cols; j++) {
+        const depth = rows - 1 - i; // 0 = back row, max = front row
+        const z = matrix[i][j];
+        const x = (j - depth) * halfW;
+        const yFlat = (j + depth) * halfH;
+        const y = yFlat - (z - mn) * heightScale;
+        row.push({ x, y, yFlat, z });
+      }
+      pts.push(row);
+    }
+    const quads = [];
+    for (let i = 0; i < rows - 1; i++) {
+      for (let j = 0; j < cols - 1; j++) {
+        const c = [pts[i][j], pts[i][j + 1], pts[i + 1][j + 1], pts[i + 1][j]];
+        const avgZ = (c[0].z + c[1].z + c[2].z + c[3].z) / 4;
+        quads.push({ c, depthKey: (rows - 1 - i) + j, avgZ });
+      }
+    }
+    quads.sort((a, b) => a.depthKey - b.depthKey); // back-to-front (painter's algorithm)
+    const all = pts.flat();
+    const minX = Math.min(...all.map((p) => p.x)), maxX = Math.max(...all.map((p) => p.x));
+    const minY = Math.min(...all.map((p) => p.y)), maxYFlat = Math.max(...all.map((p) => p.yFlat));
+    const pad = 3;
+    const w = (maxX - minX) + pad * 2, hgt = (maxYFlat - minY) + pad * 2;
+    const ox = -minX + pad, oy = -minY + pad;
+    const svg = h('svg:svg', { viewBox: `0 0 ${w} ${hgt}`, class: 'mesh-3d', 'aria-label': 'Mesh, isometric view' });
+    const g = h('svg:g', { transform: `translate(${ox},${oy})` });
+    // Base outline: the flat perimeter at each edge's lowest point, so the
+    // surface reads as floating above a ground plane.
+    const top = pts[0];
+    const right = pts.map((r) => r[cols - 1]);
+    const bottom = [...pts[rows - 1]].reverse();
+    const left = [...pts.map((r) => r[0])].reverse();
+    const perim = [...top, ...right.slice(1), ...bottom.slice(1), ...left.slice(1, -1)];
+    const baseD = perim.map((p, k) => `${k ? 'L' : 'M'} ${p.x} ${p.yFlat}`).join(' ') + ' Z';
+    g.append(h('svg:path', { d: baseD, class: 'mesh-3d-base' }));
+    // Corner stems ground the surface to the base plane.
+    for (const p of [pts[0][0], pts[0][cols - 1], pts[rows - 1][0], pts[rows - 1][cols - 1]]) {
+      g.append(h('svg:line', { x1: p.x, y1: p.yFlat, x2: p.x, y2: p.y, class: 'mesh-3d-stem' }));
+    }
+    for (const q of quads) {
+      const t = range > 0 ? (q.avgZ - mn) / range : 0.5;
+      const d = `M ${q.c[0].x} ${q.c[0].y} L ${q.c[1].x} ${q.c[1].y} L ${q.c[2].x} ${q.c[2].y} L ${q.c[3].x} ${q.c[3].y} Z`;
+      g.append(h('svg:path', { d, class: 'mesh-3d-face', style: { fill: meshColor(t) } }));
+    }
+    for (let i = 0; i < rows; i++) {
+      for (let j = 0; j < cols; j++) {
+        const p = pts[i][j];
+        const t = range > 0 ? (p.z - mn) / range : 0.5;
+        g.append(h('svg:circle', {
+          cx: p.x, cy: p.y, r: 3, class: 'mesh-3d-dot', style: { fill: meshColor(t) },
+        }, h('svg:title', { text: `X${j} Y${i}: ${p.z.toFixed(3)}mm` })));
+      }
+    }
+    svg.append(g);
+    return { svg, exaggeration };
   }
   function editPoint(x, y) {
     const cur = mesh.points[y][x];
@@ -123,56 +285,71 @@ function heatmapCard() {
     input.focus();
     input.select();
   }
-  return {
-    el,
-    update(s) {
-      const on = canBed(s);
-      body.replaceChildren();
-      if (meshLoading && !mesh) { body.append(spinner('Loading mesh')); return; }
-      if (meshErr) { body.append(note('warn', meshErr), btn('Retry', { onClick: loadMesh })); return; }
-      if (!mesh || !mesh.points) {
-        body.append(empty('layers', 'No mesh yet. Run the levelling wizard below.'));
-        return;
+  function draw(s) {
+    lastState = s;
+    const on = canBed(s);
+    rotateBtn.hidden = meshView !== '3d';
+    const key = [mesh, on, meshLoading, meshErr];
+    if (ui && ui.key.every((k, i) => k === key[i])) return;
+    ui = null;
+    body.replaceChildren();
+    if (meshLoading && !mesh) { body.append(spinner('Loading mesh')); return; }
+    if (meshErr) { body.append(note('warn', meshErr), btn('Retry', { onClick: loadMesh })); return; }
+    if (!mesh || !mesh.points) {
+      body.append(empty('layers', 'No mesh yet. Run the levelling wizard below.'));
+      return;
+    }
+    const rangeNote = mesh.range > RANGE_WARN
+      ? note('warn', `Range ${mesh.range.toFixed(3)}mm is large. Try the corner assistant before fine mesh points.`)
+      : null;
+    const cachedNote = mesh.cached
+      ? banner('info', 'Cached mesh', `Last read ${lastMeshReadText()}, live view after the print.`, { icon: 'clock' })
+      : null;
+    if (cachedNote) body.append(cachedNote);
+    const grid = h('div', { class: 'mesh-grid' });
+    // Marlin row 0 is the front (Y0): draw it last so the map faces the
+    // viewer like the printer does, matching the corner assistant.
+    for (let y = mesh.points.length - 1; y >= 0; y--) {
+      for (let x = 0; x < mesh.points[y].length; x++) {
+        const v = mesh.points[y][x];
+        const cell = h('button', {
+          type: 'button', class: 'mesh-cell tnum', style: cellStyle(v),
+          'aria-label': `Point X${x} Y${y}, ${v.toFixed(3)} millimetres. Tap to edit.`,
+          disabled: !on,
+          onclick: () => editPoint(x, y),
+        }, v.toFixed(3));
+        grid.append(cell);
       }
-      const rangeNote = mesh.range > RANGE_WARN
-        ? note('warn', `Range ${mesh.range.toFixed(3)}mm is large. Try the corner assistant before fine mesh points.`)
-        : null;
-      const cachedNote = mesh.cached
-        ? banner('info', 'Cached mesh', `Last read ${lastMeshReadText()}, live view after the print.`, { icon: 'clock' })
-        : null;
-      if (cachedNote) body.append(cachedNote);
-      const grid = h('div', { class: 'mesh-grid' });
-      // Marlin row 0 is the front (Y0): draw it last so the map faces the
-      // viewer like the printer does, matching the corner assistant.
-      for (let y = mesh.points.length - 1; y >= 0; y--) {
-        for (let x = 0; x < mesh.points[y].length; x++) {
-          const v = mesh.points[y][x];
-          const cell = h('button', {
-            type: 'button', class: 'mesh-cell tnum', style: cellStyle(v),
-            'aria-label': `Point X${x} Y${y}, ${v.toFixed(3)} millimetres. Tap to edit.`,
-            disabled: !on,
-            onclick: () => editPoint(x, y),
-          }, v.toFixed(3));
-          grid.append(cell);
-        }
-      }
-      grid.style.setProperty('--cols', mesh.points[0].length);
-      // Derive the stats from the points: never trust optional fields.
-      const all = mesh.points.flat();
-      const mn = Math.min(...all), mx = Math.max(...all);
-      body.append(
-        h('div', { class: 'mesh-stats' },
-          h('span', { class: 'meta' }, 'Min ', h('span', { class: 'num-l tnum', text: mn.toFixed(3) })),
-          h('span', { class: 'meta' }, 'Max ', h('span', { class: 'num-l tnum', text: mx.toFixed(3) })),
-          h('span', { class: 'meta' }, 'Range ', h('span', { class: 'num-l tnum', text: (mx - mn).toFixed(3) }))),
-        grid,
-        h('p', { class: 'meta mesh-front', text: 'Front of bed' }),
-        h('div', { class: 'mesh-legend meta' },
-          h('span', { text: 'Low' }), h('span', { class: 'mesh-legend-bar' }), h('span', { text: 'High' })),
-      );
-      if (rangeNote) body.append(rangeNote);
-    },
-  };
+    }
+    grid.style.setProperty('--cols', mesh.points[0].length);
+    // Derive the stats from the points: never trust optional fields.
+    const all = mesh.points.flat();
+    const mn = Math.min(...all), mx = Math.max(...all);
+    const span = mx - mn;
+    const matrix = rotatedMesh(mesh.points, meshRotation);
+    const { svg, exaggeration } = build3D(matrix, mn, span);
+    const stage = h('div', { class: `mesh-stage is-${meshView}` },
+      h('div', { class: 'mesh-2d-layer' }, grid),
+      h('div', { class: 'mesh-3d-layer' }, svg));
+    const legendBar = h('span', { class: 'mesh-legend-bar', style: { background: meshLegendGradient() } });
+    const heightNote = h('p', { class: 'meta mesh-height-note', text: span > 0 ? `Height x${exaggeration.toFixed(0)} (exaggerated for readability)` : '' });
+    const edge = h('p', { class: 'meta mesh-front', text: nearestEdge() });
+    body.append(
+      h('div', { class: 'mesh-stats' },
+        h('span', { class: 'meta' }, 'Min ', h('span', { class: 'num-l tnum', text: mn.toFixed(3) })),
+        h('span', { class: 'meta' }, 'Max ', h('span', { class: 'num-l tnum', text: mx.toFixed(3) })),
+        h('span', { class: 'meta' }, 'Range ', h('span', { class: 'num-l tnum', text: span.toFixed(3) }))),
+      stage,
+      edge,
+      heightNote,
+      h('div', { class: 'mesh-legend meta' },
+        h('span', { text: 'Low' }), legendBar, h('span', { text: 'High' })),
+    );
+    if (rangeNote) body.append(rangeNote);
+    ui = { stage, layer3d: stage.lastChild, svg, edge, height: heightNote, key };
+    applyView();
+  }
+  return { el, update: draw };
 }
 
 function wizardCard() {
