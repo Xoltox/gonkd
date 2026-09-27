@@ -13,3 +13,6 @@
 
 # Private working notes (never publish)
 notes/
+
+# Web UI dependencies
+web/ui/node_modules/
