@@ -151,11 +151,14 @@ function heatmapCard() {
         }
       }
       grid.style.setProperty('--cols', mesh.points[0].length);
+      // Derive the stats from the points: never trust optional fields.
+      const all = mesh.points.flat();
+      const mn = Math.min(...all), mx = Math.max(...all);
       body.append(
         h('div', { class: 'mesh-stats' },
-          h('span', { class: 'meta' }, 'Min ', h('span', { class: 'num-l tnum', text: mesh.min.toFixed(3) })),
-          h('span', { class: 'meta' }, 'Max ', h('span', { class: 'num-l tnum', text: mesh.max.toFixed(3) })),
-          h('span', { class: 'meta' }, 'Range ', h('span', { class: 'num-l tnum', text: mesh.range.toFixed(3) }))),
+          h('span', { class: 'meta' }, 'Min ', h('span', { class: 'num-l tnum', text: mn.toFixed(3) })),
+          h('span', { class: 'meta' }, 'Max ', h('span', { class: 'num-l tnum', text: mx.toFixed(3) })),
+          h('span', { class: 'meta' }, 'Range ', h('span', { class: 'num-l tnum', text: (mx - mn).toFixed(3) }))),
         grid,
       );
       if (rangeNote) body.append(rangeNote);

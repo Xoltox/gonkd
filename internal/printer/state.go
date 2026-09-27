@@ -165,9 +165,9 @@ type Mesh struct {
 	Active  bool        `json:"active"`
 	ZOffset float64     `json:"zOffset"`
 	Points  [][]float64 `json:"points,omitempty"`
-	Min     float64     `json:"min,omitempty"`
-	Max     float64     `json:"max,omitempty"`
-	Range   float64     `json:"range,omitempty"`
+	Min     float64     `json:"min"`
+	Max     float64     `json:"max"`
+	Range   float64     `json:"range"`
 	// Cached is true when this is the Manager's last parsed G29 S0 result,
 	// served in place of a live probe (refused with ErrJobActive) while a
 	// job is running.
